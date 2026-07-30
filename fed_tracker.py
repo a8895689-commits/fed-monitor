@@ -188,96 +188,105 @@ class DailyMarketTracker:
         return chips
 
 
-class TaiwanDerivativesTracker:
-    """主題三 (新增)：台指期權進階籌碼 (含外資買賣權、散戶多空比、VIX、PCR)"""
+class TaiwanDerivativesTrackerFinMind:
+    """主題三 (方案A)：台指期權進階籌碼 (串接 FinMind API)"""
     def __init__(self):
-        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        self.session = requests.Session()
+        self.api_url = "https://api.finmindtrade.com/api/v4/data"
 
-    def get_csv(self, url, payload):
+    def _get_fm_data(self, dataset, data_id=None, start_date=None):
+        params = {"dataset": dataset, "start_date": start_date}
+        if data_id: params["data_id"] = data_id
         try:
-            res = self.session.post(url, data=payload, headers=self.headers, timeout=10)
-            if res.status_code != 200: return pd.DataFrame()
-            res.encoding = 'big5'
-            if len(res.text) < 100: return pd.DataFrame()
-            df = pd.read_csv(io.StringIO(res.text), on_bad_lines='skip')
-            df.columns = df.columns.str.strip()
-            for col in df.columns:
-                if df[col].dtype == 'object':
-                    df[col] = df[col].astype(str).str.strip()
-            return df
+            res = requests.get(self.api_url, params=params, timeout=10)
+            if res.status_code == 200:
+                json_data = res.json()
+                if json_data.get("msg") == "success" and json_data.get("data"):
+                    return pd.DataFrame(json_data["data"])
         except Exception:
-            return pd.DataFrame()
+            pass
+        return pd.DataFrame()
 
     def fetch_data(self):
-        today = datetime.datetime.now()
-        start_date = (today - datetime.timedelta(days=15)).strftime("%Y/%m/%d")
-        end_date = today.strftime("%Y/%m/%d")
+        start_date = (datetime.datetime.now() - datetime.timedelta(days=20)).strftime("%Y-%m-%d")
+        
+        # 1. 抓取 Put/Call Ratio
+        df_pcr = self._get_fm_data("TaiwanOptionPutCallRatio", start_date=start_date)
+        if df_pcr.empty:
+            return "\n⚠️ 無法取得 FinMind 籌碼數據，請檢查網路或稍後再試\n"
 
-        # 抓取各項資料表
-        df_pcr = self.get_csv("https://www.taifex.com.tw/cht/3/pcRatioDown", {"queryStartDate": start_date, "queryEndDate": end_date})
-        df_vix = self.get_csv("https://www.taifex.com.tw/cht/3/vixInfoDown", {"queryStartDate": start_date, "queryEndDate": end_date})
-        df_opt = self.get_csv("https://www.taifex.com.tw/cht/3/callsAndPutsDateDown", {"queryStartDate": start_date, "queryEndDate": end_date})
-        df_fut = self.get_csv("https://www.taifex.com.tw/cht/3/futContractsDateDown", {"queryStartDate": start_date, "queryEndDate": end_date})
-        df_mtx = self.get_csv("https://www.taifex.com.tw/cht/3/futDataDown", {"down_type": "1", "commodity_id": "MTX", "queryStartDate": start_date, "queryEndDate": end_date})
-        df_tmf = self.get_csv("https://www.taifex.com.tw/cht/3/futDataDown", {"down_type": "1", "commodity_id": "TMF", "queryStartDate": start_date, "queryEndDate": end_date})
+        dates = sorted(df_pcr['date'].unique(), reverse=True)
+        if len(dates) < 2:
+            return "\n⚠️ FinMind 籌碼歷史天數不足\n"
 
-        if df_pcr.empty or df_opt.empty or df_fut.empty:
-            return "⚠️ 無法取得期交所進階籌碼資料\n"
+        d1, d2 = dates[0], dates[1] # 最新與前一交易日
 
-        dates = sorted(df_pcr['日期'].unique(), reverse=True)
-        if len(dates) < 2: return "⚠️ 籌碼資料日期不足\n"
-        d1, d2 = dates[0], dates[1] # 最新與前一日
+        # 2. 抓取其他各類進階籌碼
+        df_vix = self._get_fm_data("TaiwanOptionVix", start_date=start_date)
+        df_opt = self._get_fm_data("TaiwanOptionInstitutionalInvestors", data_id="TXO", start_date=start_date)
+        df_mtx_inst = self._get_fm_data("TaiwanFuturesInstitutionalInvestors", data_id="MTX", start_date=start_date)
+        df_tmf_inst = self._get_fm_data("TaiwanFuturesInstitutionalInvestors", data_id="TMF", start_date=start_date)
+        df_mtx_daily = self._get_fm_data("TaiwanFuturesDaily", data_id="MTX", start_date=start_date)
+        df_tmf_daily = self._get_fm_data("TaiwanFuturesDaily", data_id="TMF", start_date=start_date)
 
-        # === 資料解析輔助函式 ===
-        def get_val(df, date_val, target_col):
-            try:
-                res = df[df['日期'] == date_val]
-                return float(str(res[target_col].values[0]).replace(',', '')) if not res.empty else 0
-            except: return 0
+        # 輔助解析函式
+        def get_pcr(date_str):
+            sub = df_pcr[df_pcr['date'] == date_str]
+            return float(sub['put_call_ratio'].values[0]) if not sub.empty and 'put_call_ratio' in sub.columns else 0.0
 
-        def get_opt_oi(df, date_val, cp_type):
-            try:
-                sub = df[(df['日期'] == date_val) & (df['身份別'] == '外資及陸資') & (df['商品名稱'] == '臺指選擇權') & (df['買賣權'] == cp_type)]
-                return int(str(sub['未平倉餘額買賣差額'].values[0]).replace(',', '')) if not sub.empty else 0
-            except: return 0
+        def get_vix(date_str):
+            if df_vix.empty: return 0.0
+            sub = df_vix[df_vix['date'] == date_str]
+            col = 'vix' if 'vix' in sub.columns else ('close' if 'close' in sub.columns else '')
+            return float(sub[col].values[0]) if not sub.empty and col else 0.0
 
-        def get_inst_fut_net(df, date_val, name_kw):
-            try:
-                sub = df[(df['日期'] == date_val) & (df['商品名稱'].str.contains(name_kw))].copy()
-                if sub.empty: return 0
-                sub['未平倉餘額買賣差額'] = pd.to_numeric(sub['未平倉餘額買賣差額'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
-                return int(sub['未平倉餘額買賣差額'].sum())
-            except: return 0
+        def get_opt_foreign(date_str, cp_type):
+            if df_opt.empty: return 0
+            sub = df_opt[(df_opt['date'] == date_str) & 
+                         (df_opt['institutional_investors'].astype(str).str.contains('外資', na=False)) & 
+                         (df_opt['calls_puts'].astype(str).str.contains(cp_type, na=False))]
+            if not sub.empty:
+                if 'open_interest_balance' in sub.columns:
+                    return int(sub['open_interest_balance'].values[0])
+                elif 'open_interest_buy_volume' in sub.columns:
+                    return int(sub['open_interest_buy_volume'].values[0] - sub['open_interest_sell_volume'].values[0])
+            return 0
 
-        def get_total_oi(df, date_val):
-            try:
-                date_col = '交易日期' if '交易日期' in df.columns else '日期'
-                sub = df[(df[date_col] == date_val) & (df['交易時段'] == '一般')].copy()
-                if sub.empty: return 1
-                sub['未平倉量'] = pd.to_numeric(sub['未平倉量'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
-                return int(sub['未平倉量'].sum())
-            except: return 1
+        def get_retail_net_oi(df_inst, date_str):
+            if df_inst.empty: return 0
+            sub = df_inst[df_inst['date'] == date_str]
+            if not sub.empty:
+                if 'open_interest_balance' in sub.columns:
+                    return -int(sub['open_interest_balance'].sum())
+                elif 'open_interest_buy_volume' in sub.columns:
+                    inst_tot = (sub['open_interest_buy_volume'] - sub['open_interest_sell_volume']).sum()
+                    return -int(inst_tot)
+            return 0
 
-        # === 提取各項指標 ===
-        pcr_1, pcr_2 = get_val(df_pcr, d1, '買賣權未平倉量比率%'), get_val(df_pcr, d2, '買賣權未平倉量比率%')
-        vix_1, vix_2 = get_val(df_vix, d1, '臺指選擇權波動率指數'), get_val(df_vix, d2, '臺指選擇權波動率指數')
-        fc_1, fc_2 = get_opt_oi(df_opt, d1, '買權'), get_opt_oi(df_opt, d2, '買權')
-        fp_1, fp_2 = get_opt_oi(df_opt, d1, '賣權'), get_opt_oi(df_opt, d2, '賣權')
+        def get_total_oi(df_daily, date_str):
+            if df_daily.empty: return 1
+            sub = df_daily[df_daily['date'] == date_str]
+            if not sub.empty and 'open_interest' in sub.columns:
+                return int(sub['open_interest'].sum())
+            return 1
 
-        # 散戶淨未平倉 = -(三大法人淨未平倉加總)
-        ret_mtx_1, ret_mtx_2 = -get_inst_fut_net(df_fut, d1, '小型'), -get_inst_fut_net(df_fut, d2, '小型')
-        ret_tmf_1, ret_tmf_2 = -get_inst_fut_net(df_fut, d1, '微型'), -get_inst_fut_net(df_fut, d2, '微型')
+        # 提取與計算
+        pcr_1, pcr_2 = get_pcr(d1), get_pcr(d2)
+        vix_1, vix_2 = get_vix(d1), get_vix(d2)
+        fc_1, fc_2 = get_opt_foreign(d1, '買權'), get_opt_foreign(d2, '買權')
+        fp_1, fp_2 = get_opt_foreign(d1, '賣權'), get_opt_foreign(d2, '賣權')
 
-        mtx_oi_1, mtx_oi_2 = get_total_oi(df_mtx, d1), get_total_oi(df_mtx, d2)
-        tmf_oi_1, tmf_oi_2 = get_total_oi(df_tmf, d1), get_total_oi(df_tmf, d2)
+        ret_mtx_1, ret_mtx_2 = get_retail_net_oi(df_mtx_inst, d1), get_retail_net_oi(df_mtx_inst, d2)
+        ret_tmf_1, ret_tmf_2 = get_retail_net_oi(df_tmf_inst, d1), get_retail_net_oi(df_tmf_inst, d2)
 
-        ret_mtx_ratio_1 = (ret_mtx_1 / mtx_oi_1) * 100 if mtx_oi_1 > 1 else 0
-        ret_mtx_ratio_2 = (ret_mtx_2 / mtx_oi_2) * 100 if mtx_oi_2 > 1 else 0
-        ret_tmf_ratio_1 = (ret_tmf_1 / tmf_oi_1) * 100 if tmf_oi_1 > 1 else 0
-        ret_tmf_ratio_2 = (ret_tmf_2 / tmf_oi_2) * 100 if tmf_oi_2 > 1 else 0
+        mtx_tot_1, mtx_tot_2 = get_total_oi(df_mtx_daily, d1), get_total_oi(df_mtx_daily, d2)
+        tmf_tot_1, tmf_tot_2 = get_total_oi(df_tmf_daily, d1), get_total_oi(df_tmf_daily, d2)
 
-        # === 排版輸出 ===
+        ret_mtx_ratio_1 = (ret_mtx_1 / mtx_tot_1) * 100 if mtx_tot_1 > 1 else 0.0
+        ret_mtx_ratio_2 = (ret_mtx_2 / mtx_tot_2) * 100 if mtx_tot_2 > 1 else 0.0
+        ret_tmf_ratio_1 = (ret_tmf_1 / tmf_tot_1) * 100 if tmf_tot_1 > 1 else 0.0
+        ret_tmf_ratio_2 = (ret_tmf_2 / tmf_tot_2) * 100 if tmf_tot_2 > 1 else 0.0
+
+        # 排版輸出輔助
         def s_str(val): return f"+{val}" if val > 0 else str(val)
         def s_fstr(val): return f"+{val:.2f}" if val > 0 else f"{val:.2f}"
         def arrow(curr, prev): return "↗" if curr > prev else ("↘" if curr < prev else "→")
@@ -315,7 +324,6 @@ class TaiwanOptionsTracker:
                 if len(row) > 1 and '發行量加權股價指數' in str(row[0]):
                     return float(str(row[1]).replace(',', ''))
         except Exception:
-            # 備援機制：如果證交所阻擋，從 yfinance 抓取大盤
             try:
                 hist = yf.Ticker("^TWII").history(period="5d")
                 return float(hist['Close'].iloc[-1])
@@ -366,7 +374,6 @@ class TaiwanOptionsTracker:
         today = datetime.datetime.now()
         valid_dfs = {}
         
-        # 尋找最近兩天的選擇權資料
         for i in range(12):
             test_date = today - datetime.timedelta(days=i)
             df = self.get_taifex_csv(test_date)
@@ -499,8 +506,8 @@ if __name__ == "__main__":
     prices.update(treasury_yields)
     chips = market_bot.fetch_twse_institutional()
     
-    # 3. 抓取台指期權進階籌碼 (包含 VIX、PCR、外資買賣權、散戶多空比)
-    derivatives_bot = TaiwanDerivativesTracker()
+    # 3. 抓取台指期權進階籌碼 (方案A: 透過 FinMind API 抓取)
+    derivatives_bot = TaiwanDerivativesTrackerFinMind()
     derivatives_msg = derivatives_bot.fetch_data()
 
     # 4. 抓取台指選擇權莊家痛點資料
@@ -527,7 +534,7 @@ if __name__ == "__main__":
         msg += f"• {name}: {icon} {net_buy}\n"
         
     msg += "======================"
-    # 將新增的台指進階籌碼(散戶/外資/VIX)放在選擇權痛點前面
+    # 串接台指進階籌碼 (散戶/外資/VIX)
     msg += derivatives_msg
     msg += "======================"
     msg += opt_msg
