@@ -1,99 +1,148 @@
 import os
-import json
 import urllib.request
+import json
 import pandas as pd
+import yfinance as yf
+import requests
 
-class LineFedMonitor:
-    def __init__(self):
-        # 讀取環境變數中的金鑰
-        self.fred_api_key = os.getenv("FRED_API_KEY")
-        self.line_token = os.getenv("LINE_ACCESS_TOKEN")
-        self.line_user_id = os.getenv("LINE_USER_ID")
+class LiveFedPredictor:
+    """主題一：聯準會利率決策預測模組 (串接 FRED API)"""
+    def __init__(self, api_key):
+        self.api_key = api_key
         self.base_url = "https://api.stlouisfed.org/fred/series/observations"
 
     def _get_latest_obs(self, series_id, units="lin"):
-        url = f"{self.base_url}?series_id={series_id}&api_key={self.fred_api_key}&file_type=json&sort_order=desc&limit=5&units={units}"
+        url = f"{self.base_url}?series_id={series_id}&api_key={self.api_key}&file_type=json&sort_order=desc&limit=10&units={units}"
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req) as response:
                 data = json.loads(response.read().decode('utf-8'))
                 for obs in data.get('observations', []):
                     if obs.get('value', '.') != '.':
-                        return float(obs['value']), obs.get('date')
-        except Exception as e:
-            print(f"⚠️ {series_id} 抓取失敗: {e}")
+                        return float(obs.get('value')), obs.get('date')
+        except Exception:
+            pass
         return None, None
 
-    def run_analysis_and_notify(self):
-        print("🔄 開始抓取 FRED 數據...")
-        
-        # 抓取指標
-        pce_val, pce_date = self._get_latest_obs("PCEPILFE", units="pc1")
-        eci_val, _ = self._get_latest_obs("ECIALLCIV", units="pc1")
-        jolts_val, _ = self._get_latest_obs("JTSJOL")
-        unemp_val, _ = self._get_latest_obs("UNEMPLOY")
-        jolts_ratio = round(jolts_val / unemp_val, 2) if (jolts_val and unemp_val) else None
-        sahm_val, _ = self._get_latest_obs("SAHMREALTIME")
-        nfci_val, _ = self._get_latest_obs("NFCI")
-        inf_exp_val, _ = self._get_latest_obs("T5YIE")
-
+    def analyze(self):
         metrics = [
-            ("Core PCE", pce_val, 0.25, lambda x: "Hike" if x > 3.2 else ("Cut" if x < 2.3 else "Hold")),
-            ("ECI 薪資", eci_val, 0.20, lambda x: "Hike" if x > 4.0 else ("Cut" if x < 2.8 else "Hold")),
-            ("JOLTS 求供比", jolts_ratio, 0.15, lambda x: "Hike" if x > 1.50 else ("Cut" if x < 0.80 else "Hold")),
-            ("薩姆規則", sahm_val, 0.15, lambda x: "Cut" if x >= 0.50 else "Hold"),
-            ("NFCI 金融條件", nfci_val, 0.15, lambda x: "Hike" if x < -0.60 else ("Cut" if x > 0.20 else "Hold")),
-            ("5Y 通膨預期", inf_exp_val, 0.10, lambda x: "Hike" if x > 2.70 else ("Cut" if x < 1.80 else "Hold"))
+            ("Core PCE通膨", "PCEPILFE", "pc1", 0.25, lambda x: "Hike" if x > 3.2 else ("Cut" if x < 2.3 else "Hold")),
+            ("ECI就業成本", "ECIALLCIV", "pc1", 0.20, lambda x: "Hike" if x > 4.0 else ("Cut" if x < 2.8 else "Hold")),
+            ("薩姆衰退規則", "SAHMREALTIME", "lin", 0.15, lambda x: "Cut" if x >= 0.50 else "Hold")
         ]
-
-        hike_score, cut_score, hold_score = 0.0, 0.0, 0.0
-        report_lines = [f"📊 【聯準會決策儀表板】\n📅 數據發布: {pce_date}\n"]
-
-        for name, val, weight, eval_fn in metrics:
+        
+        results, hike_score, cut_score, hold_score = [], 0.0, 0.0, 0.0
+        for name, sid, unit, weight, eval_fn in metrics:
+            val, date = self._get_latest_obs(sid, units=unit)
             if val is not None:
                 signal = eval_fn(val)
-                if signal == "Hike":
-                    hike_score += weight
-                    tag = "🔴 升息"
-                elif signal == "Cut":
-                    cut_score += weight
-                    tag = "🟢 降息"
-                else:
-                    hold_score += weight
-                    tag = "🟡 持平"
-                report_lines.append(f"• {name}: {val:.2f} [{tag}]")
+                if signal == "Hike": hike_score += weight; sig_txt = "🔴 升息"
+                elif signal == "Cut": cut_score += weight; sig_txt = "🟢 降息"
+                else: hold_score += weight; sig_txt = "🟡 持平"
+                results.append({"指標": name, "數值": f"{val:.2f}", "判定": sig_txt})
+            else:
+                results.append({"指標": name, "數值": "N/A", "判定": "❓ 缺資料"})
 
-        tot = hike_score + cut_score + hold_score
-        hike_p, hold_p, cut_p = round(hike_score/tot*100, 1), round(hold_score/tot*100, 1), round(cut_score/tot*100, 1)
-
-        report_lines.append(f"\n🎯 升降息機率預估：")
-        report_lines.append(f"🔴 升息: {hike_p}% | 🟡 持平: {hold_p}% | 🟢 降息: {cut_p}%")
-        
-        final_report = "\n".join(report_lines)
-        self._send_line(final_report)
-
-    def _send_line(self, text):
-        if not (self.line_token and self.line_user_id):
-            print("❌ 缺少 LINE 金鑰，無法發送")
-            return
-        
-        url = "https://api.line.me/v2/bot/message/push"
-        payload = json.dumps({
-            "to": self.line_user_id,
-            "messages": [{"type": "text", "text": text}]
-        }).encode('utf-8')
-
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.line_token}"
+        total = hike_score + cut_score + hold_score
+        prob = {
+            "升息": round((hike_score / total) * 100, 1) if total > 0 else 0,
+            "降息": round((cut_score / total) * 100, 1) if total > 0 else 0,
+            "持平": round((hold_score / total) * 100, 1) if total > 0 else 0
         }
+        return results, prob
+
+
+class DailyMarketTracker:
+    """主題二：台美股價與台股籌碼自動化模組"""
+    def __init__(self):
+        self.headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+
+    def fetch_yfinance_prices(self):
+        """抓取美股與大盤指數"""
+        tickers = {
+            "台股大盤": "^TWII",
+            "費半指數": "^SOX",
+            "輝達 NVDA": "NVDA",
+            "台積電 ADR": "TSM"
+        }
+        prices = {}
+        for name, symbol in tickers.items():
+            try:
+                # 抓取最近一天的收盤價
+                stock = yf.Ticker(symbol)
+                hist = stock.history(period="1d")
+                if not hist.empty:
+                    prices[name] = round(hist['Close'].iloc[-1], 2)
+                else:
+                    prices[name] = "N/A"
+            except Exception:
+                prices[name] = "N/A (Error)"
+        return prices
+
+    def fetch_twse_institutional(self):
+        """抓取台灣證交所三大法人買賣超 (單位: 億元)"""
+        url = "https://www.twse.com.tw/fund/BFI82U?response=json&type=day"
+        chips = {"外資及陸資": "N/A", "投信": "N/A", "自營商(自行)": "N/A", "自營商(避險)": "N/A"}
         try:
-            req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-            with urllib.request.urlopen(req) as resp:
-                print("✅ LINE 訊息推播成功！請檢查手機。")
-        except Exception as e:
-            print(f"❌ LINE 發送失敗: {e}")
+            res = requests.get(url, headers=self.headers, timeout=5)
+            data = res.json()
+            if data.get('stat') == 'OK':
+                for row in data['data']:
+                    name = row[0].strip()
+                    # 將字串中的逗號去除並轉為億元
+                    net_buy = round(int(row[3].replace(',', '')) / 100000000, 2)
+                    if "外資及陸資" in name: chips["外資及陸資"] = net_buy
+                    elif "投信" in name: chips["投信"] = net_buy
+                    elif "自營商(自行買賣)" in name: chips["自營商(自行)"] = net_buy
+                    elif "自營商(避險)" in name: chips["自營商(避險)"] = net_buy
+        except Exception:
+            chips = {k: "N/A (遭證交所阻擋)" for k in chips}
+        return chips
+
+def send_line_message(token, user_id, text):
+    url = 'https://api.line.me/v2/bot/message/push'
+    headers = {'Content-Type': 'application/json', 'Authorization': f'Bearer {token}'}
+    data = {"to": user_id, "messages": [{"type": "text", "text": text}]}
+    req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers, method='POST')
+    urllib.request.urlopen(req)
 
 if __name__ == "__main__":
-    monitor = LineFedMonitor()
-    monitor.run_analysis_and_notify()
+    FRED_API_KEY = os.environ.get("FRED_API_KEY")
+    LINE_ACCESS_TOKEN = os.environ.get("LINE_ACCESS_TOKEN")
+    LINE_USER_ID = os.environ.get("LINE_USER_ID")
+
+    if not all([FRED_API_KEY, LINE_ACCESS_TOKEN, LINE_USER_ID]):
+        print("❌ 錯誤：找不到環境變數")
+        exit(1)
+
+    # 1. 抓取美聯儲數據
+    fed_bot = LiveFedPredictor(api_key=FRED_API_KEY)
+    fed_results, prob = fed_bot.analyze()
+    max_policy = max(prob, key=prob.get)
+
+    # 2. 抓取市場價格與籌碼數據
+    market_bot = DailyMarketTracker()
+    prices = market_bot.fetch_yfinance_prices()
+    chips = market_bot.fetch_twse_institutional()
+
+    # 3. 組合 LINE 訊息
+    msg = "🌍 量化交易宏觀儀表板 🌍\n"
+    msg += "=" * 22 + "\n"
+    msg += "🏦 【Fed 決策預測】\n"
+    msg += f"升息 {prob['升息']}% | 降息 {prob['降息']}% | 持平 {prob['持平']}%\n"
+    msg += f"👉 綜合預測：【{max_policy}】\n\n"
+    
+    msg += "📈 【全球核心資產報價】\n"
+    for name, price in prices.items():
+        msg += f"• {name}: {price}\n"
+    
+    msg += "\n💰 【台股現貨籌碼 (單位:億)】\n"
+    for name, net_buy in chips.items():
+        # 自動標示買賣超的表情符號
+        icon = "🔴" if isinstance(net_buy, (int, float)) and net_buy > 0 else ("🟢" if isinstance(net_buy, (int, float)) and net_buy < 0 else "⚪")
+        msg += f"• {name}: {icon} {net_buy}\n"
+        
+    msg += "\n(註: 期貨未平倉與融資券因交易所資安限制，暫以現貨為主作為每日動能觀測)"
+
+    send_line_message(LINE_ACCESS_TOKEN, LINE_USER_ID, msg)
+    print("✅ 執行完畢並成功推播！")
