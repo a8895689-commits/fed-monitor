@@ -10,7 +10,6 @@ import datetime
 import io
 import urllib3
 
-# 關閉 pandas 警告與 SSL 警告
 pd.options.mode.chained_assignment = None
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -191,23 +190,29 @@ class DailyMarketTracker:
 
 
 class TaiwanDerivativesTrackerTaifex:
-    """主題三：台指期權進階籌碼 (精準散戶淨額與多空比修復版)"""
+    """主題三：台指期權進階籌碼 (精準解析器 - 完全對應期交所真實表格)"""
     def __init__(self):
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": "https://www.taifex.com.tw/cht/3/pcRatio",
+            "Referer": "https://www.taifex.com.tw/",
             "Origin": "https://www.taifex.com.tw"
         }
 
     @staticmethod
-    def parse_taifex_date(val):
-        """嚴格日期解析器：限定目前合理交易年份範圍"""
+    def clean_num(val):
+        if pd.isna(val) or val is None: return 0
+        s = str(val).replace(',', '').replace('%', '').strip()
+        if not s or s in ('-', 'N/A', 'nan', 'NaN', 'null'): return 0
+        try:
+            return float(s)
+        except:
+            return 0.0
+
+    def parse_taifex_date(self, val):
         if pd.isna(val): return None
         s = str(val).strip().replace('-', '').replace('/', '').replace('.', '').split(' ')[0]
         if not s.isdigit(): return None
-        
         now_year = datetime.datetime.now().year
-        
         if len(s) == 8:
             try:
                 y, m, d = int(s[:4]), int(s[4:6]), int(s[6:8])
@@ -222,39 +227,158 @@ class TaiwanDerivativesTrackerTaifex:
             except: pass
         return None
 
-    def get_taifex_csv(self, url, payload):
+    def get_pcr_data(self, d_start, d_end):
+        url = "https://www.taifex.com.tw/cht/3/pcRatioDown"
+        payload = {"queryStartDate": d_start, "queryEndDate": d_end}
         try:
             res = requests.post(url, data=payload, headers=self.headers, timeout=10, verify=False)
-            if res.status_code != 200 or not res.text.strip() or "<html" in res.text.lower():
-                query_str = urllib.parse.urlencode(payload)
-                res = requests.get(f"{url}?{query_str}", headers=self.headers, timeout=10, verify=False)
-
-            if res.status_code != 200: return pd.DataFrame()
-            try:
-                csv_text = res.content.decode('big5')
-            except:
-                csv_text = res.text
+            res.encoding = 'big5'
+            df = pd.read_csv(io.StringIO(res.text))
+            df.columns = df.columns.str.strip()
+            date_col = next((c for c in df.columns if '日期' in c or 'Date' in c), None)
+            ratio_col = next((c for c in df.columns if '比率' in c or 'Ratio' in c), None)
             
-            if not csv_text.strip() or "<html" in csv_text.lower(): return pd.DataFrame()
-            
-            df = pd.read_csv(io.StringIO(csv_text), on_bad_lines='skip')
-            df.columns = df.columns.str.strip().str.replace(' ', '')
-            
-            for date_col in ['交易日期', 'Date', '日期']:
-                if date_col in df.columns and date_col != '日期':
-                    df.rename(columns={date_col: '日期'}, inplace=True)
-            
-            if '日期' not in df.columns: return pd.DataFrame()
-            
-            df['日期'] = df['日期'].apply(self.parse_taifex_date)
-            df = df.dropna(subset=['日期'])
-            
-            for col in df.columns:
-                if df[col].dtype == 'object': 
-                    df[col] = df[col].astype(str).str.strip()
-            return df
+            pcr_map = {}
+            if date_col and ratio_col:
+                for _, row in df.iterrows():
+                    d = self.parse_taifex_date(row[date_col])
+                    if d: pcr_map[d] = self.clean_num(row[ratio_col])
+            return pcr_map
         except:
-            return pd.DataFrame()
+            return {}
+
+    def get_vix_data(self, d_start, d_end):
+        url = "https://www.taifex.com.tw/cht/7/vixData"
+        payload = {"queryStartDate": d_start, "queryEndDate": d_end}
+        try:
+            res = requests.post(url, data=payload, headers=self.headers, timeout=10, verify=False)
+            res.encoding = 'utf-8'
+            dfs = pd.read_html(io.StringIO(res.text))
+            vix_map = {}
+            for d in dfs:
+                d.columns = d.columns.str.strip()
+                date_col = next((c for c in d.columns if '日期' in c or 'Date' in c), None)
+                close_col = next((c for c in d.columns if '收盤' in c), None)
+                if date_col and close_col:
+                    for _, row in d.iterrows():
+                        dt = self.parse_taifex_date(row[date_col])
+                        if dt: vix_map[dt] = self.clean_num(row[close_col])
+                    break
+            return vix_map
+        except:
+            return {}
+
+    def get_option_foreign_net(self, d_start, d_end):
+        """【精準對應截圖表結構】：解析台指選擇權買權/賣權外資淨額"""
+        url = "https://www.taifex.com.tw/cht/3/callsAndPutsDateDown"
+        payload = {"queryStartDate": d_start, "queryEndDate": d_end, "commodityId": "TXO"}
+        call_map, put_map = {}, {}
+        try:
+            res = requests.post(url, data=payload, headers=self.headers, timeout=10, verify=False)
+            res.encoding = 'big5'
+            lines = res.text.splitlines()
+            valid_lines = [line for line in lines if not line.startswith('※') and not line.startswith('單位')]
+            df = pd.read_csv(io.StringIO("\n".join(valid_lines)))
+            df.columns = df.columns.str.strip()
+
+            date_col = next((c for c in df.columns if '日期' in c), None)
+            prod_col = next((c for c in df.columns if '商品' in c), None)
+            id_col = next((c for c in df.columns if '身份' in c), None)
+
+            if date_col and prod_col and id_col:
+                for d_val in df[date_col].unique():
+                    dt = self.parse_taifex_date(d_val)
+                    if not dt: continue
+                    sub = df[df[date_col] == d_val]
+                    
+                    # 依截圖：買權為「臺指選擇權」，賣權為「賣權」相關名稱
+                    for _, r in sub.iterrows():
+                        if '外資' in str(r[id_col]):
+                            prod_name = str(r[prod_col])
+                            
+                            # 未平倉買方(口數) 與 未平倉賣方(口數)
+                            # 在 CSV 欄位順序中，買方OI 通常在 -4 或 -5 位置，賣方在 -2 位置
+                            # 直接拿數值計算：買方未平倉口數 - 賣方未平倉口數
+                            vals = [self.clean_num(v) for v in r.values if str(v).replace(',', '').replace('-', '').isdigit()]
+                            if len(vals) >= 6:
+                                long_oi = vals[-4]  # 買方未平倉
+                                short_oi = vals[-2] # 賣方未平倉
+                                net_oi = int(long_oi - short_oi)
+                                
+                                if '買權' in prod_name or '臺指選擇權' in prod_name:
+                                    call_map[dt] = net_oi
+                                elif '賣權' in prod_name:
+                                    put_map[dt] = net_oi
+        except Exception as e:
+            pass
+        return call_map, put_map
+
+    def get_futures_data(self, cid, d_start, d_end):
+        """【精準對應期貨表】：計算三大法人淨額與全市場未平倉量"""
+        url_inst = "https://www.taifex.com.tw/cht/3/futContractsDateDown"
+        payload_inst = {"queryStartDate": d_start, "queryEndDate": d_end, "commodityId": cid}
+        
+        url_daily = "https://www.taifex.com.tw/cht/3/futDataDown"
+        payload_daily = {"queryStartDate": d_start, "queryEndDate": d_end, "commodity_id": cid, "down_type": "1"}
+
+        inst_net_map = {}
+        tot_oi_map = {}
+
+        # 1. 三大法人合計
+        try:
+            res = requests.post(url_inst, data=payload_inst, headers=self.headers, timeout=10, verify=False)
+            res.encoding = 'big5'
+            lines = [l for l in res.text.splitlines() if not l.startswith('※') and not l.startswith('單位')]
+            df = pd.read_csv(io.StringIO("\n".join(lines)))
+            df.columns = df.columns.str.strip()
+
+            date_col = next((c for c in df.columns if '日期' in c), None)
+            if date_col:
+                for d_val in df[date_col].unique():
+                    dt = self.parse_taifex_date(d_val)
+                    if not dt: continue
+                    sub = df[df[date_col] == d_val]
+                    
+                    total_inst_net = 0
+                    for _, r in sub.iterrows():
+                        # 擷取純數字欄位
+                        nums = [self.clean_num(v) for v in r.values if str(v).replace(',', '').replace('-', '').isdigit()]
+                        if len(nums) >= 4:
+                            long_oi = nums[-4]   # 多方未平倉
+                            short_oi = nums[-2]  # 空方未平倉
+                            total_inst_net += (long_oi - short_oi)
+                    inst_net_map[dt] = int(total_inst_net)
+        except:
+            pass
+
+        # 2. 全市場 OI
+        try:
+            res = requests.post(url_daily, data=payload_daily, headers=self.headers, timeout=10, verify=False)
+            res.encoding = 'big5'
+            lines = [l for l in res.text.splitlines() if not l.startswith('※') and not l.startswith('單位')]
+            df = pd.read_csv(io.StringIO("\n".join(lines)))
+            df.columns = df.columns.str.strip()
+
+            date_col = next((c for c in df.columns if '日期' in c), None)
+            session_col = next((c for c in df.columns if '時段' in c), None)
+            if date_col:
+                for d_val in df[date_col].unique():
+                    dt = self.parse_taifex_date(d_val)
+                    if not dt: continue
+                    sub = df[df[date_col] == d_val]
+                    if session_col:
+                        sub = sub[sub[session_col].astype(str).str.contains('一般', na=False)]
+                    
+                    tot_oi = 0
+                    for _, r in sub.iterrows():
+                        nums = [self.clean_num(v) for v in r.values if str(v).replace(',', '').isdigit()]
+                        if len(nums) > 0:
+                            tot_oi += nums[-1] # 最後一欄通常為未沖銷契約數
+                    tot_oi_map[dt] = int(tot_oi)
+        except:
+            pass
+
+        return inst_net_map, tot_oi_map
 
     def fetch_data(self):
         end_date = datetime.datetime.now()
@@ -262,153 +386,41 @@ class TaiwanDerivativesTrackerTaifex:
         d_start = start_date.strftime("%Y/%m/%d")
         d_end = end_date.strftime("%Y/%m/%d")
 
-        def pl_pcr(): return {"queryStartDate": d_start, "queryEndDate": d_end}
-        def pl_inst(cid): return {"queryStartDate": d_start, "queryEndDate": d_end, "commodityId": cid}
-        def pl_daily(cid): return {"queryStartDate": d_start, "queryEndDate": d_end, "commodity_id": cid, "down_type": "1"}
-
-        # 1. 抓取 PCR
-        df_pcr = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/pcRatioDown", pl_pcr())
-
-        # 2. 抓取三大法人選擇權與期貨資料 (小台 MTX / 微台 TMF)
-        df_opt = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/callsAndPutsDateDown", pl_inst("TXO"))
-        df_mtx_inst = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futContractsDateDown", pl_inst("MTX"))
-        df_tmf_inst = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futContractsDateDown", pl_inst("TMF"))
+        pcr_map = self.get_pcr_data(d_start, d_end)
+        vix_map = self.get_vix_data(d_start, d_end)
+        call_map, put_map = self.get_option_foreign_net(d_start, d_end)
         
-        # 3. 抓取全市場期貨總未平倉量
-        df_mtx_daily = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futDataDown", pl_daily("MTX"))
-        df_tmf_daily = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futDataDown", pl_daily("TMF"))
+        mtx_inst, mtx_tot = self.get_futures_data("MTX", d_start, d_end)
+        tmf_inst, tmf_tot = self.get_futures_data("TMF", d_start, d_end)
 
-        # 4. 抓取 VIX 指數
-        df_vix = pd.DataFrame()
-        try:
-            res_vix = requests.post("https://www.taifex.com.tw/cht/7/vixData", data=pl_pcr(), headers=self.headers, timeout=10, verify=False)
-            res_vix.encoding = 'utf-8'
-            dfs = pd.read_html(io.StringIO(res_vix.text))
-            for d in dfs:
-                d.columns = d.columns.str.strip().str.replace(' ', '')
-                for date_col_name in ['交易日期', 'Date']:
-                    if date_col_name in d.columns:
-                        d.rename(columns={date_col_name: '日期'}, inplace=True)
-                        break
-                        
-                if '日期' in d.columns and '收盤指數' in d.columns:
-                    d['日期'] = d['日期'].apply(self.parse_taifex_date)
-                    d = d.dropna(subset=['日期'])
-                    df_vix = d
-                    break
-        except:
-            pass
+        all_dates = sorted(list(set(list(pcr_map.keys()) + list(mtx_tot.keys()) + list(tmf_tot.keys()))), reverse=True)
 
-        # 彙整所有表格中的有效日期
-        valid_dates = set()
-        for df in [df_pcr, df_opt, df_mtx_inst, df_tmf_inst, df_mtx_daily, df_tmf_daily]:
-            if not df.empty and '日期' in df.columns:
-                for d in df['日期'].unique():
-                    if d: valid_dates.add(d)
+        if not all_dates:
+            return "\n⚠️ 期交所資料更新中或連線異常，請稍後再試\n"
 
-        dates = sorted(list(valid_dates), reverse=True)
-        if len(dates) == 0:
-            return "\n⚠️ 期交所目前伺服器連線異常或無有效資料，請稍後再試\n"
+        d1 = all_dates[0]
+        d2 = all_dates[1] if len(all_dates) > 1 else d1
 
-        d1 = dates[0]
-        d2 = dates[1] if len(dates) > 1 else d1 
+        # 取值與算式
+        pcr_1, pcr_2 = pcr_map.get(d1, 0.0), pcr_map.get(d2, 0.0)
+        vix_1, vix_2 = vix_map.get(d1, 0.0), vix_map.get(d2, 0.0)
+        fc_1, fc_2 = call_map.get(d1, 0), call_map.get(d2, 0)
+        fp_1, fp_2 = put_map.get(d1, 0), put_map.get(d2, 0)
 
-        # ===== 強健數字轉換 =====
-        def clean_num(val):
-            if pd.isna(val) or val is None: return 0
-            s = str(val).replace(',', '').replace('%', '').strip()
-            if not s or s in ('-', 'N/A', 'nan', 'NaN', 'null'): return 0
-            try:
-                return float(s)
-            except:
-                return 0.0
+        # 散戶淨額 = 全市場總OI - 三大法人淨額
+        ret_m_1 = mtx_tot.get(d1, 0) - mtx_inst.get(d1, 0)
+        ret_m_2 = mtx_tot.get(d2, 0) - mtx_inst.get(d2, 0)
 
-        def get_pcr(d_str):
-            if df_pcr.empty: return 0.0
-            sub = df_pcr[df_pcr['日期'] == d_str]
-            if sub.empty: return 0.0
-            pcr_col = next((c for c in sub.columns if '未平倉' in c and ('比率' in c or 'ratio' in c.lower())), None)
-            if not pcr_col: pcr_col = next((c for c in sub.columns if '比率' in c or 'ratio' in c.lower() or 'pcr' in c.lower()), None)
-            return clean_num(sub[pcr_col].values[0]) if pcr_col else 0.0
+        ret_t_1 = tmf_tot.get(d1, 0) - tmf_inst.get(d1, 0)
+        ret_t_2 = tmf_tot.get(d2, 0) - tmf_inst.get(d2, 0)
 
-        def get_vix(d_str):
-            if df_vix.empty: return 0.0
-            sub = df_vix[df_vix['日期'] == d_str]
-            return clean_num(sub['收盤指數'].values[0]) if not sub.empty and '收盤指數' in sub.columns else 0.0
+        # 多空比 = (散戶淨額 / 全市場總OI) * 100%
+        rr_m_1 = (ret_m_1 / mtx_tot.get(d1, 1)) * 100 if mtx_tot.get(d1, 0) > 0 else 0.0
+        rr_m_2 = (ret_m_2 / mtx_tot.get(d2, 1)) * 100 if mtx_tot.get(d2, 0) > 0 else 0.0
 
-        def get_opt_foreign(d_str, cp):
-            if df_opt.empty: return 0
-            cp_col = next((col for col in df_opt.columns if '買賣' in col), None)
-            id_col = next((col for col in df_opt.columns if '身份' in col), None)
-            net_col = next((c for c in df_opt.columns if '淨額' in c or '未平倉淨' in c), None)
-            
-            if not cp_col or not id_col or not net_col: return 0
-            
-            sub = df_opt[(df_opt['日期'] == d_str) & 
-                         (df_opt[id_col].astype(str).str.contains('外資', na=False)) & 
-                         (df_opt[cp_col].astype(str).str.contains(cp, na=False))]
-            return int(clean_num(sub[net_col].values[0])) if not sub.empty else 0
+        rr_t_1 = (ret_t_1 / tmf_tot.get(d1, 1)) * 100 if tmf_tot.get(d1, 0) > 0 else 0.0
+        rr_t_2 = (ret_t_2 / tmf_tot.get(d2, 1)) * 100 if tmf_tot.get(d2, 0) > 0 else 0.0
 
-        # ===== 【關鍵修正】取得三大法人淨未平倉合計 =====
-        def get_inst_net(df, d_str):
-            if df.empty: return 0
-            sub = df[df['日期'] == d_str] 
-            if sub.empty: return 0
-            
-            # 優先搜尋未平倉淨額欄位
-            net_col = next((c for c in df.columns if '未平倉餘額淨額' in c or '未平倉淨' in c or '淨額' in c), None)
-            if net_col:
-                return int(sum([clean_num(x) for x in sub[net_col].values]))
-            
-            # 若無淨額欄位，拿多方未平倉減空方未平倉
-            long_col = next((c for c in df.columns if '多方' in c and '未平倉' in c), None)
-            short_col = next((c for c in df.columns if '空方' in c and '未平倉' in c), None)
-            if long_col and short_col:
-                return int(sum([clean_num(r[long_col]) - clean_num(r[short_col]) for _, r in sub.iterrows()]))
-            return 0
-
-        # ===== 取得全市場總未平倉量 =====
-        def get_tot_oi(df, d_str):
-            if df.empty: return 0
-            sub = df[df['日期'] == d_str] 
-            if sub.empty: return 0
-            if '交易時段' in sub.columns: 
-                sub = sub[sub['交易時段'].astype(str).str.contains('一般', na=False)] 
-            oi_col = next((c for c in df.columns if '未沖銷' in c or '未平倉' in c), None)
-            if not sub.empty and oi_col: 
-                return int(sum([clean_num(x) for x in sub[oi_col].values]))
-            return 0
-
-        # 數值計算
-        pcr_1, pcr_2 = get_pcr(d1), get_pcr(d2)
-        vix_1, vix_2 = get_vix(d1), get_vix(d2)
-        
-        fc_1, fc_2 = get_opt_foreign(d1, '買權'), get_opt_foreign(d2, '買權')
-        fp_1, fp_2 = get_opt_foreign(d1, '賣權'), get_opt_foreign(d2, '賣權')
-        
-        # 三大法人淨額
-        inst_m_1, inst_m_2 = get_inst_net(df_mtx_inst, d1), get_inst_net(df_mtx_inst, d2)
-        inst_t_1, inst_t_2 = get_inst_net(df_tmf_inst, d1), get_inst_net(df_tmf_inst, d2)
-        
-        # 全市場未平倉量 (Total OI)
-        tot_m_1, tot_m_2 = get_tot_oi(df_mtx_daily, d1), get_tot_oi(df_mtx_daily, d2)
-        tot_t_1, tot_t_2 = get_tot_oi(df_tmf_daily, d1), get_tot_oi(df_tmf_daily, d2)
-
-        # 【核心修正】：散戶淨未平倉 = 全市場未平倉量 - 三大法人淨未平倉
-        ret_m_1 = tot_m_1 - inst_m_1 if tot_m_1 > 0 else -inst_m_1
-        ret_m_2 = tot_m_2 - inst_m_2 if tot_m_2 > 0 else -inst_m_2
-        
-        ret_t_1 = tot_t_1 - inst_t_1 if tot_t_1 > 0 else -inst_t_1
-        ret_t_2 = tot_t_2 - inst_t_2 if tot_t_2 > 0 else -inst_t_2
-
-        # 散戶多空比 % = (散戶淨未平倉 / 全市場未平倉量) * 100
-        rr_m_1 = (ret_m_1 / tot_m_1) * 100 if tot_m_1 > 0 else 0.0
-        rr_m_2 = (ret_m_2 / tot_m_2) * 100 if tot_m_2 > 0 else 0.0
-        
-        rr_t_1 = (ret_t_1 / tot_t_1) * 100 if tot_t_1 > 0 else 0.0
-        rr_t_2 = (ret_t_2 / tot_t_2) * 100 if tot_t_2 > 0 else 0.0
-
-        # ===== 格式化訊息 =====
         def s_str(v): return f"+{v}" if v > 0 else str(v)
         def s_fstr(v): return f"+{v:.2f}" if v > 0 else f"{v:.2f}"
         def ar(c, p): return "↗" if c > p else ("↘" if c < p else "→")
@@ -632,7 +644,7 @@ if __name__ == "__main__":
     prices.update(treasury_yields)
     chips = market_bot.fetch_twse_institutional()
     
-    # 3. 抓取台指期權進階籌碼 (修正版)
+    # 3. 抓取台指期權進階籌碼
     derivatives_bot = TaiwanDerivativesTrackerTaifex()
     derivatives_msg = derivatives_bot.fetch_data()
 
