@@ -211,8 +211,11 @@ class TaiwanDerivativesTrackerTaifex:
             
             if '日期' not in df.columns: return pd.DataFrame()
             
-            # 【關鍵修復 2】: 嚴格過濾垃圾列 (Footer)，只保留 YYYY/MM/DD 格式的有效資料
-            df = df[df['日期'].astype(str).str.match(r'^\d{4}/\d{2}/\d{2}$', na=False)]
+            # 【關鍵修復 2】: 使用 pd.to_datetime 自動過濾垃圾資料 (將備註文字轉為 NaT 並剔除)
+            df['日期'] = pd.to_datetime(df['日期'], errors='coerce')
+            df = df.dropna(subset=['日期'])
+            # 統一標準化為 YYYY/MM/DD 格式，這樣不管是 7/30 還是 07/30 都不會比對失敗
+            df['日期'] = df['日期'].dt.strftime('%Y/%m/%d')
             
             for col in df.columns:
                 if df[col].dtype == 'object': 
@@ -263,8 +266,11 @@ class TaiwanDerivativesTrackerTaifex:
                         break
                         
                 if '日期' in d.columns and '收盤指數' in d.columns:
-                    # 【關鍵修復 3】: 同樣過濾 VIX 的垃圾日期
-                    d = d[d['日期'].astype(str).str.match(r'^\d{4}/\d{2}/\d{2}$', na=False)]
+                    # 【關鍵修復 3】: VIX 表格同樣使用 pd.to_datetime 過濾垃圾資訊
+                    d['日期'] = pd.to_datetime(d['日期'], errors='coerce')
+                    d = d.dropna(subset=['日期'])
+                    d['日期'] = d['日期'].dt.strftime('%Y/%m/%d')
+                    
                     df_vix = d
                     break
         except:
@@ -276,8 +282,9 @@ class TaiwanDerivativesTrackerTaifex:
 
         # ===== 資料提取與計算邏輯 =====
         def get_pcr(d_str):
+            if df_pcr.empty: return 0.0
             sub = df_pcr[df_pcr['日期'] == d_str]
-            # 【關鍵修復 4】: 優先抓「未平倉量比率」，避免誤抓成「成交量比率」
+            # 優先抓未平倉量比率
             pcr_col = next((c for c in df_pcr.columns if '未平倉' in c and ('比率' in c or 'Ratio' in c)), None)
             if not pcr_col: pcr_col = next((c for c in df_pcr.columns if '比率' in c or 'Ratio' in c), None)
             return s_flt(sub[pcr_col].values[0]) if not sub.empty and pcr_col else 0.0
@@ -296,7 +303,6 @@ class TaiwanDerivativesTrackerTaifex:
                          (df_opt['身份別'].astype(str).str.contains('外資', na=False)) & 
                          (df_opt[cp_col].astype(str).str.contains(cp, na=False))]
                          
-            # 【關鍵修復 5】: 優先抓「未平倉淨額」，避免誤抓成「多空淨額(當沖量)」
             net_col = next((c for c in df_opt.columns if '未平倉淨' in c), None)
             if not net_col: net_col = next((c for c in df_opt.columns if '淨額' in c), None)
             
@@ -306,7 +312,6 @@ class TaiwanDerivativesTrackerTaifex:
             if df.empty: return 0
             sub = df[df['日期'] == d_str] 
             
-            # 【關鍵修復 6】: 同樣優先抓「未平倉淨額」
             net_col = next((c for c in df.columns if '未平倉淨' in c), None)
             if not net_col: net_col = next((c for c in df.columns if '淨額' in c), None)
             if not net_col: return 0
@@ -360,7 +365,6 @@ class TaiwanDerivativesTrackerTaifex:
         msg += f"• VIX指標: {vix_2:.2f} {ar(vix_1, vix_2)} {vix_1:.2f}\n"
 
         return msg
-
 
 class TaiwanOptionsTracker:
     """主題四：台指選擇權莊家籌碼與痛點計算"""
