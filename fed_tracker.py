@@ -4,6 +4,7 @@ import json
 import pandas as pd
 import yfinance as yf
 import requests
+import re
 
 class LiveFedPredictor:
     """主題一：聯準會利率決策預測模組 (串接 FRED API)"""
@@ -12,13 +13,12 @@ class LiveFedPredictor:
         self.base_url = "https://api.stlouisfed.org/fred/series/observations"
 
     def _get_latest_obs(self, series_id, units="lin"):
-        """修改為抓取最新『兩筆』有效資料，以計算漲跌幅"""
+        """抓取最新『兩筆』有效資料，以計算漲跌幅"""
         url = f"{self.base_url}?series_id={series_id}&api_key={self.api_key}&file_type=json&sort_order=desc&limit=10&units={units}"
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req) as response:
                 data = json.loads(response.read().decode('utf-8'))
-                # 過濾出數值不是 '.' 的有效資料
                 valid_obs = [obs for obs in data.get('observations', []) if obs.get('value', '.') != '.']
                 
                 if len(valid_obs) >= 2:
@@ -30,21 +30,32 @@ class LiveFedPredictor:
         return None, None, None
 
     def analyze(self):
-        # 擴充後的指標庫 (權重總和為 1.0)
+        # 指標資料庫 (名稱, FRED代碼, 單位, 權重, 判定邏輯, 門檻條件說明)
         metrics = [
-            ("Core PCE", "PCEPILFE", "pc1", 0.25, lambda x: "Hike" if x > 3.2 else ("Cut" if x < 2.3 else "Hold")),
-            ("ECI 薪資", "ECIALLCIV", "pc1", 0.20, lambda x: "Hike" if x > 4.0 else ("Cut" if x < 2.8 else "Hold")),
-            ("JOLTS 求供比", "JOLTS_RATIO", "lin", 0.15, lambda x: "Hike" if x > 1.2 else ("Cut" if x < 0.8 else "Hold")),
-            ("薩姆規則", "SAHMREALTIME", "lin", 0.15, lambda x: "Cut" if x >= 0.50 else "Hold"),
-            ("NFCI 金融條件", "NFCI", "lin", 0.15, lambda x: "Hike" if x < -0.7 else ("Cut" if x > 0.5 else "Hold")),
-            ("5Y 通膨預期", "T5YIE", "lin", 0.10, lambda x: "Hike" if x > 2.5 else ("Cut" if x < 2.0 else "Hold"))
+            ("Core PCE", "PCEPILFE", "pc1", 0.25, 
+             lambda x: "Hike" if x > 3.2 else ("Cut" if x < 2.3 else "Hold"), 
+             "升>3.2 / 降<2.3"),
+            ("ECI 薪資", "ECIALLCIV", "pc1", 0.20, 
+             lambda x: "Hike" if x > 4.0 else ("Cut" if x < 2.8 else "Hold"), 
+             "升>4.0 / 降<2.8"),
+            ("JOLTS 求供比", "JOLTS_RATIO", "lin", 0.15, 
+             lambda x: "Hike" if x > 1.2 else ("Cut" if x < 0.8 else "Hold"), 
+             "升>1.2 / 降<0.8"),
+            ("薩姆規則", "SAHMREALTIME", "lin", 0.15, 
+             lambda x: "Cut" if x >= 0.50 else "Hold", 
+             "降≥0.50"),
+            ("NFCI 金融條件", "NFCI", "lin", 0.15, 
+             lambda x: "Hike" if x < -0.7 else ("Cut" if x > 0.5 else "Hold"), 
+             "升<-0.7 / 降>0.5"),
+            ("5Y 通膨預期", "T5YIE", "lin", 0.10, 
+             lambda x: "Hike" if x > 2.5 else ("Cut" if x < 2.0 else "Hold"), 
+             "升>2.5 / 降<2.0")
         ]
         
         results, dates = [], []
         hike_score, cut_score, hold_score = 0.0, 0.0, 0.0
         
-        for name, sid, unit, weight, eval_fn in metrics:
-            # 針對 JOLTS 求供比進行客製化計算 (職缺數 / 失業人數)
+        for name, sid, unit, weight, eval_fn, condition_str in metrics:
             if sid == "JOLTS_RATIO":
                 jol_val1, jol_val2, d1 = self._get_latest_obs("JTSJOL", "lin")
                 unemp_val1, unemp_val2, d2 = self._get_latest_obs("UNEMPLOY", "lin")
@@ -61,7 +72,6 @@ class LiveFedPredictor:
                 if date: dates.append(date)
                 signal = eval_fn(val)
                 
-                # 計算與前一期的變化
                 diff_str = ""
                 if prev_val is not None:
                     diff = val - prev_val
@@ -78,10 +88,19 @@ class LiveFedPredictor:
                     hold_score += weight
                     sig_txt = "🟡 持平"
                     
-                # 組合字串，例如 3.41 (+0.60)
-                results.append({"指標": name, "數值": f"{val:.2f}{diff_str}", "判定": sig_txt})
+                results.append({
+                    "指標": name, 
+                    "數值": f"{val:.2f}{diff_str}", 
+                    "判定": sig_txt,
+                    "門檻": condition_str
+                })
             else:
-                results.append({"指標": name, "數值": "N/A", "判定": "❓ 缺資料"})
+                results.append({
+                    "指標": name, 
+                    "數值": "N/A", 
+                    "判定": "❓ 缺資料",
+                    "門檻": condition_str
+                })
 
         total = hike_score + cut_score + hold_score
         prob = {
@@ -97,7 +116,9 @@ class LiveFedPredictor:
 class DailyMarketTracker:
     """主題二：台美股價與台股籌碼自動化模組"""
     def __init__(self):
-        self.headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
 
     def fetch_yfinance_prices(self):
         """抓取美股、大盤指數與匯率 (含漲跌幅計算)"""
@@ -106,7 +127,7 @@ class DailyMarketTracker:
             "費半指數": "^SOX",
             "輝達 NVDA": "NVDA",
             "台積電 ADR": "TSM",
-            "美元兌台幣": "TWD=X"   # <-- 新增匯率報價
+            "美元兌台幣": "TWD=X"
         }
         prices = {}
         for name, symbol in tickers.items():
@@ -150,44 +171,90 @@ class DailyMarketTracker:
             chips = {k: "N/A (遭阻擋)" for k in chips}
         return chips
 
-    def fetch_twse_margin(self):
-        """免費且穩定的官方管道：抓取證交所最新融資融券餘額"""
-        url = "https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json"
-        margin_data = {
-            "融資餘額(億)": "N/A", 
-            "融券餘額(萬張)": "N/A", 
-            "融資維持率": "N/A (官方未直接提供)"
-        }
+    def fetch_thirdparty_margin(self):
+        """多重管道抓取融資融券：放棄TWSE，改用 鉅亨網 (Anue) / 嗨投資 (HiStock) / 玩股網 (WantGoo) 備援"""
+        # 管道 1：鉅亨網 (Anue) API
         try:
+            url = "https://api.cnyes.com/media/api/v1/market/tw/margin"
             res = requests.get(url, headers=self.headers, timeout=5)
-            data = res.json()
-            if data.get('stat') == 'OK':
-                # 證交所 API 的 data1 包含了「信用交易統計」
-                # 欄位依序：[0]項目名稱, [1]買進, [2]賣出, [3]現金(券)償還, [4]前日餘額, [5]今日餘額
-                for row in data.get('data1', []):
-                    item_name = row[0]
-                    if "融資金額(仟元)" in item_name:
-                        prev_bal = float(row[4].replace(',', ''))
-                        curr_bal = float(row[5].replace(',', ''))
-                        
-                        # 將 仟元 轉為 億 (除以 100,000)
-                        curr_yi = curr_bal / 100000
-                        diff_yi = (curr_bal - prev_bal) / 100000
-                        sign = "+" if diff_yi > 0 else ""
-                        margin_data["融資餘額(億)"] = f"{curr_yi:.2f} ({sign}{diff_yi:.2f})"
-                        
-                    elif "融券(交易單位)" in item_name:
-                        prev_bal = float(row[4].replace(',', ''))
-                        curr_bal = float(row[5].replace(',', ''))
-                        
-                        # 將 張 轉為 萬張 (除以 10,000)
-                        curr_wan = curr_bal / 10000
-                        diff_wan = (curr_bal - prev_bal) / 10000
-                        sign = "+" if diff_wan > 0 else ""
-                        margin_data["融券餘額(萬張)"] = f"{curr_wan:.2f} ({sign}{diff_wan:.2f})"
+            if res.status_code == 200:
+                data = res.json()
+                items = data.get('items', [])
+                if items:
+                    latest = items[0]
+                    margin_bal = float(latest.get('marginLongBalance', 0)) / 100000
+                    margin_diff = float(latest.get('marginLongChange', 0)) / 100000
+                    short_bal = float(latest.get('marginShortBalance', 0)) / 10000
+                    short_diff = float(latest.get('marginShortChange', 0)) / 10000
+                    
+                    sign_m = "+" if margin_diff > 0 else ""
+                    sign_s = "+" if short_diff > 0 else ""
+                    return {
+                        "融資餘額(億)": f"{margin_bal:.2f} ({sign_m}{margin_diff:.2f})",
+                        "融券餘額(萬張)": f"{short_bal:.2f} ({sign_s}{short_diff:.2f})",
+                        "融資維持率": "N/A (官方未直接提供)"
+                    }
         except Exception:
             pass
-        return margin_data
+
+        # 管道 2：嗨投資 (HiStock) 網頁解析
+        try:
+            url = "https://histock.tw/stock/margin.aspx"
+            res = requests.get(url, headers=self.headers, timeout=5)
+            if res.status_code == 200:
+                html = res.text
+                m_bal = re.search(r'融資餘額.*?([\d,]+\.?\d*)', html)
+                m_diff = re.search(r'融資增減.*?([+-]?[\d,]+\.?\d*)', html)
+                s_bal = re.search(r'融券餘額.*?([\d,]+\.?\d*)', html)
+                s_diff = re.search(r'融券增減.*?([+-]?[\d,]+\.?\d*)', html)
+                
+                if m_bal and m_diff:
+                    mb = float(m_bal.group(1).replace(',', ''))
+                    md_str = m_diff.group(1).replace(',', '')
+                    md = float(md_str)
+                    
+                    sb = float(s_bal.group(1).replace(',', '')) if s_bal else 0.0
+                    sd_str = s_diff.group(1).replace(',', '') if s_diff else "0"
+                    sd = float(sd_str)
+                    
+                    sign_m = "+" if md > 0 and not md_str.startswith('+') else ""
+                    sign_s = "+" if sd > 0 and not sd_str.startswith('+') else ""
+                    return {
+                        "融資餘額(億)": f"{mb:.2f} ({sign_m}{md_str})",
+                        "融券餘額(萬張)": f"{sd:.2f} ({sign_s}{sd_str})",
+                        "融資維持率": "N/A (官方未直接提供)"
+                    }
+        except Exception:
+            pass
+
+        # 管道 3：玩股網 (WantGoo) API 備援
+        try:
+            url = "https://www.wantgoo.com/investor/margin-trading/total-data"
+            res = requests.get(url, headers=self.headers, timeout=5)
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, list) and len(data) > 0:
+                    latest = data[0]
+                    mb = float(latest.get('marginBalance', 0))
+                    md = float(latest.get('marginChange', 0))
+                    sb = float(latest.get('shortBalance', 0))
+                    sd = float(latest.get('shortChange', 0))
+                    
+                    sign_m = "+" if md > 0 else ""
+                    sign_s = "+" if sd > 0 else ""
+                    return {
+                        "融資餘額(億)": f"{mb:.2f} ({sign_m}{md:.2f})",
+                        "融券餘額(萬張)": f"{sb:.2f} ({sign_s}{sd:.2f})",
+                        "融資維持率": "N/A (官方未直接提供)"
+                    }
+        except Exception:
+            pass
+
+        return {
+            "融資餘額(億)": "N/A",
+            "融券餘額(萬張)": "N/A",
+            "融資維持率": "N/A (官方未直接提供)"
+        }
 
 def send_line_message(token, user_id, text):
     url = 'https://api.line.me/v2/bot/message/push'
@@ -213,9 +280,9 @@ if __name__ == "__main__":
     market_bot = DailyMarketTracker()
     prices = market_bot.fetch_yfinance_prices()
     
-    # 2.5 抓取證交所三大法人與融資融券 (免費官方管道)
+    # 2.5 抓取三大法人與第三方融資融券 (鉅亨網/嗨投資/玩股網多重備援)
     chips = market_bot.fetch_twse_institutional()
-    margin_data = market_bot.fetch_twse_margin()
+    margin_data = market_bot.fetch_thirdparty_margin()
     chips.update(margin_data)
 
     # 3. 組合 LINE 訊息 
@@ -223,7 +290,7 @@ if __name__ == "__main__":
     msg += f"📅 數據發布: {latest_date}\n\n"
     
     for res in fed_results:
-        msg += f"• {res['指標']}: {res['數值']} [{res['判定']}]\n"
+        msg += f"• {res['指標']}: {res['數值']} [{res['判定']}] (門檻: {res['門檻']})\n"
 
     msg += "\n🎯 升降息機率預估：\n"
     msg += f"🔴 升息: {prob['升息']}% | 🟡 持平: {prob['持平']}% | 🟢 降息: {prob['降息']}%\n\n"
@@ -235,7 +302,6 @@ if __name__ == "__main__":
     
     msg += "\n💰 【台股現貨與信用籌碼】\n"
     for name, net_buy in chips.items():
-        # 自動給予紅綠白燈：若是數字根據正負給燈，若是字串(如融資)根據括弧內的正負號給燈
         if isinstance(net_buy, (int, float)):
             icon = "🔴" if net_buy > 0 else ("🟢" if net_buy < 0 else "⚪")
         elif isinstance(net_buy, str) and "(+" in net_buy:
