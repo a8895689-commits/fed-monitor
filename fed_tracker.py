@@ -189,7 +189,7 @@ class DailyMarketTracker:
 
 
 class TaiwanDerivativesTrackerTaifex:
-    """主題三 (方案B)：台指期權進階籌碼 (直接串接期交所 API)"""
+    """主題三 (方案B)：台指期權進階籌碼 (直接串接期交所 API - 強化容錯版)"""
     def __init__(self):
         self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
@@ -199,12 +199,19 @@ class TaiwanDerivativesTrackerTaifex:
             if res.status_code != 200: return pd.DataFrame()
             res.encoding = 'big5'
             csv_text = res.text
-            # 檢查是否有資料
-            if "日期" not in csv_text and "Date" not in csv_text: return pd.DataFrame()
             
             # 讀取 CSV 並略過結尾可能出現的備註干擾
             df = pd.read_csv(io.StringIO(csv_text), on_bad_lines='skip')
             df.columns = df.columns.str.strip().str.replace(' ', '')
+            
+            # 【關鍵修復】: 強制將不同名稱的日期欄位統一轉換為 '日期'
+            for date_col in ['交易日期', 'Date']:
+                if date_col in df.columns:
+                    df.rename(columns={date_col: '日期'}, inplace=True)
+            
+            # 檢查是否有最終標準化的 '日期' 欄位
+            if '日期' not in df.columns: return pd.DataFrame()
+            
             for col in df.columns:
                 if df[col].dtype == 'object': 
                     df[col] = df[col].str.strip()
@@ -248,9 +255,15 @@ class TaiwanDerivativesTrackerTaifex:
             res_vix.encoding = 'utf-8'
             dfs = pd.read_html(io.StringIO(res_vix.text))
             for d in dfs:
+                d.columns = d.columns.str.strip().str.replace(' ', '')
+                # 同樣對 VIX 表格進行日期標準化
+                for date_col_name in ['交易日期', 'Date']:
+                    if date_col_name in d.columns:
+                        d.rename(columns={date_col_name: '日期'}, inplace=True)
+                        break
+                        
                 if '日期' in d.columns and '收盤指數' in d.columns:
                     df_vix = d
-                    df_vix.columns = df_vix.columns.str.strip().str.replace(' ', '')
                     break
         except:
             pass
@@ -262,7 +275,9 @@ class TaiwanDerivativesTrackerTaifex:
         # ===== 資料提取與計算邏輯 =====
         def get_pcr(d_str):
             sub = df_pcr[df_pcr['日期'] == d_str]
-            return s_flt(sub['買賣權未平倉量比率%'].values[0]) if not sub.empty and '買賣權未平倉量比率%' in sub.columns else 0.0
+            # 動態找尋 pcr 欄位
+            pcr_col = next((c for c in df_pcr.columns if '比率' in c or 'Ratio' in c), None)
+            return s_flt(sub[pcr_col].values[0]) if not sub.empty and pcr_col else 0.0
 
         def get_vix(d_str):
             if df_vix.empty: return 0.0
@@ -271,34 +286,39 @@ class TaiwanDerivativesTrackerTaifex:
 
         def get_opt_foreign(d_str, cp):
             if df_opt.empty: return 0
-            
-            # 動態找出包含「買賣權」的欄位名稱 (自動相容 '買賣權' 或 '買賣權別')
+            # 動態找出包含「買賣權」的欄位名稱
             cp_col = next((col for col in df_opt.columns if '買賣權' in col), None)
+            if not cp_col: return 0
             
-            # 如果真的找不到相關欄位，直接回傳 0 避免整個程式崩潰
-            if not cp_col: 
-                return 0
-
             sub = df_opt[(df_opt['日期'] == d_str) & 
                          (df_opt['身份別'].str.contains('外資', na=False)) & 
                          (df_opt[cp_col].str.contains(cp, na=False))]
                          
-            return s_int(sub['未平倉淨額口數'].values[0]) if not sub.empty and '未平倉淨額口數' in sub.columns else 0
+            net_col = next((c for c in df_opt.columns if '淨額' in c), None)
+            return s_int(sub[net_col].values[0]) if not sub.empty and net_col else 0
 
         def get_ret_net(df, d_str):
             if df.empty: return 0
-            sub = df[df['日期'] == d_str]
+            sub = df[df['日期'] == d_str] # 現在保證有 '日期' 欄位
+            
+            # 動態搜尋淨額欄位 (多空淨額口數 or 未平倉淨額口數)
+            net_col = next((c for c in df.columns if '淨額' in c), None)
+            if not net_col: return 0
+            
             # 散戶淨額 = - (三大法人淨額總和)
-            return -sum([s_int(x) for x in sub['未平倉淨額口數'].values]) if not sub.empty and '未平倉淨額口數' in sub.columns else 0
+            return -sum([s_int(x) for x in sub[net_col].values]) if not sub.empty else 0
 
         def get_tot(df, d_str):
             if df.empty: return 1
-            # 兼容不同表格的日期欄位名稱
-            sub = df[df['交易日期'] == d_str] if '交易日期' in df.columns else df[df['日期'] == d_str]
+            sub = df[df['日期'] == d_str] # 現在保證有 '日期' 欄位
+            
             if '交易時段' in sub.columns: 
-                sub = sub[sub['交易時段'].str.contains('一般', na=False)] # 排除夜盤避免重複計算
-            if not sub.empty and '未沖銷契約量' in sub.columns: 
-                return sum([s_int(x) for x in sub['未沖銷契約量'].values])
+                sub = sub[sub['交易時段'].str.contains('一般', na=False)] # 排除夜盤
+            
+            # 動態搜尋未平倉欄位 (未沖銷契約量 or 未平倉量)
+            oi_col = next((c for c in df.columns if '未沖銷' in c or '未平倉' in c), None)
+            if not sub.empty and oi_col: 
+                return sum([s_int(x) for x in sub[oi_col].values])
             return 1
 
         pcr_1, pcr_2 = get_pcr(d1), get_pcr(d2)
@@ -539,7 +559,7 @@ if __name__ == "__main__":
     prices.update(treasury_yields)
     chips = market_bot.fetch_twse_institutional()
     
-    # 3. 抓取台指期權進階籌碼 (🚀 改為方案B: 直接串接期交所)
+    # 3. 抓取台指期權進階籌碼
     derivatives_bot = TaiwanDerivativesTrackerTaifex()
     derivatives_msg = derivatives_bot.fetch_data()
 
@@ -567,7 +587,6 @@ if __name__ == "__main__":
         msg += f"• {name}: {icon} {net_buy}\n"
         
     msg += "======================"
-    # 串接台指進階籌碼 (散戶/外資/VIX)
     msg += derivatives_msg
     msg += "======================"
     msg += opt_msg
