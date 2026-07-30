@@ -84,7 +84,7 @@ class DailyMarketTracker:
         self.headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
 
     def fetch_yfinance_prices(self):
-        """抓取美股與大盤指數"""
+        """抓取美股與大盤指數 (含漲跌幅計算)"""
         tickers = {
             "台股大盤": "^TWII",
             "費半指數": "^SOX",
@@ -95,9 +95,24 @@ class DailyMarketTracker:
         for name, symbol in tickers.items():
             try:
                 stock = yf.Ticker(symbol)
-                hist = stock.history(period="1d")
-                if not hist.empty:
-                    prices[name] = round(hist['Close'].iloc[-1], 2)
+                # 抓取最近 5 天資料，確保能拿到前一個交易日的收盤價
+                hist = stock.history(period="5d")
+                
+                if len(hist) >= 2:
+                    current_price = hist['Close'].iloc[-1]
+                    prev_price = hist['Close'].iloc[-2]
+                    
+                    # 計算漲跌幅 %
+                    pct_change = ((current_price - prev_price) / prev_price) * 100
+                    
+                    # 格式化字串 (正數加上 + 號，負數自帶 - 號)
+                    sign = "+" if pct_change > 0 else ""
+                    prices[name] = f"{current_price:.2f} ({sign}{pct_change:.2f}%)"
+                    
+                elif len(hist) == 1:
+                    # 萬一只有一天資料的防呆機制
+                    current_price = hist['Close'].iloc[-1]
+                    prices[name] = f"{current_price:.2f} (N/A)"
                 else:
                     prices[name] = "N/A"
             except Exception:
@@ -148,7 +163,7 @@ if __name__ == "__main__":
     prices = market_bot.fetch_yfinance_prices()
     chips = market_bot.fetch_twse_institutional()
 
-    # 3. 組合 LINE 訊息 (全新排版)
+    # 3. 組合 LINE 訊息 
     msg = "📊 【聯準會決策儀表板】\n"
     msg += f"📅 數據發布: {latest_date}\n\n"
     
