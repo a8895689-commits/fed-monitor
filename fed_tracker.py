@@ -271,7 +271,18 @@ class TaiwanDerivativesTrackerTaifex:
 
         def get_opt_foreign(d_str, cp):
             if df_opt.empty: return 0
-            sub = df_opt[(df_opt['日期'] == d_str) & (df_opt['身份別'].str.contains('外資', na=False)) & (df_opt['買賣權'].str.contains(cp, na=False))]
+            
+            # 動態找出包含「買賣權」的欄位名稱 (自動相容 '買賣權' 或 '買賣權別')
+            cp_col = next((col for col in df_opt.columns if '買賣權' in col), None)
+            
+            # 如果真的找不到相關欄位，直接回傳 0 避免整個程式崩潰
+            if not cp_col: 
+                return 0
+
+            sub = df_opt[(df_opt['日期'] == d_str) & 
+                         (df_opt['身份別'].str.contains('外資', na=False)) & 
+                         (df_opt[cp_col].str.contains(cp, na=False))]
+                         
             return s_int(sub['未平倉淨額口數'].values[0]) if not sub.empty and '未平倉淨額口數' in sub.columns else 0
 
         def get_ret_net(df, d_str):
