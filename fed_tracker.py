@@ -129,13 +129,13 @@ if __name__ == "__main__":
     msg = "🌍 全球與台股總經儀表板 🌍\n"
     msg += "=" * 20 + "\n"
     msg += "🇺🇸 【主題一：聯準會預測】\n"
-    msg += f"🔴 升息機率：{prob['升息機率']}%\n"
-    msg += f"🟡 持平機率：{prob['按兵不動機率']}%\n"
-    msg += f"🟢 降息機率：{prob['降息機率']}%\n"
+    msg += f"🔴 升息機率：{prob['升息']}%\n"
+    msg += f"🟡 持平機率：{prob['持平']}%\n"
+    msg += f"🟢 降息機率：{prob['降息']}%\n"
     msg += f"🎯 結論最支持：【{max_policy}】\n\n"
     msg += "[微觀數據追蹤]\n"
     for _, row in df_fed.iterrows():
-        msg += f"• {row['指標名稱']}: {row['最新數值']} ({row['燈號判定'].split(' ')[0]})\n"
+        msg += f"• {row['指標']}: {row['數值']} ({row['判定'].split(' ')[0]})\n"
 
     msg += "📈 【全球核心資產報價】\n"
     for name, price in prices.items():
