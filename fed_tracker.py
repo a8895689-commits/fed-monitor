@@ -133,9 +133,7 @@ if __name__ == "__main__":
     msg += f"🟡 持平機率：{prob['持平']}%\n"
     msg += f"🟢 降息機率：{prob['降息']}%\n"
     msg += f"🎯 結論最支持：【{max_policy}】\n\n"
-    msg += "[微觀數據追蹤]\n"
-    for _, row in df_fed.iterrows():
-        msg += f"• {row['指標']}: {row['數值']} ({row['判定'].split(' ')[0]})\n"
+    
 
     msg += "📈 【全球核心資產報價】\n"
     for name, price in prices.items():
