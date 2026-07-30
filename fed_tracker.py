@@ -126,13 +126,16 @@ if __name__ == "__main__":
     chips = market_bot.fetch_twse_institutional()
 
     # 3. 組合 LINE 訊息
+    report_lines = [f"📊 【聯準會決策儀表板】\n📅 數據發布: {pce_date}\n"]
     msg = "🌍 全球與台股總經儀表板 🌍\n"
     msg += "=" * 20 + "\n"
     msg += "🇺🇸 【主題一：聯準會預測】\n"
     msg += f"🔴 升息機率：{prob['升息']}%\n"
     msg += f"🟡 持平機率：{prob['持平']}%\n"
     msg += f"🟢 降息機率：{prob['降息']}%\n"
-    msg += f"🎯 結論最支持：【{max_policy}】\n\n"
+    msg += "🏦 【Fed 決策預測】\n"
+    msg += f"升息 {prob['升息']}% | 降息 {prob['降息']}% | 持平 {prob['持平']}%\n"
+    msg += f"👉 綜合預測：【{max_policy}】\n\n"
     
 
     msg += "📈 【全球核心資產報價】\n"
