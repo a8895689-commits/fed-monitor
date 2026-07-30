@@ -233,8 +233,12 @@ class TaiwanDerivativesTrackerTaifex:
         try:
             res = requests.post(url, data=payload, headers=self.headers, timeout=10, verify=False)
             res.encoding = 'big5'
-            df = pd.read_csv(io.StringIO(res.text))
-            df.columns = df.columns.str.strip()
+            # 過濾註腳說明，避免 Pandas 誤判導致崩潰
+            lines = [l for l in res.text.splitlines() if not l.startswith('※') and len(l.split(',')) > 2]
+            if not lines: return {}
+            
+            df = pd.read_csv(io.StringIO("\n".join(lines)))
+            df.columns = df.columns.str.strip().str.replace(' ', '')
             date_col = next((c for c in df.columns if '日期' in c or 'Date' in c), None)
             ratio_col = next((c for c in df.columns if '比率' in c or 'Ratio' in c), None)
             
@@ -256,7 +260,7 @@ class TaiwanDerivativesTrackerTaifex:
             dfs = pd.read_html(io.StringIO(res.text))
             vix_map = {}
             for d in dfs:
-                d.columns = d.columns.str.strip()
+                d.columns = d.columns.str.strip().str.replace(' ', '')
                 date_col = next((c for c in d.columns if '日期' in c or 'Date' in c), None)
                 close_col = next((c for c in d.columns if '收盤' in c), None)
                 if date_col and close_col:
@@ -277,39 +281,44 @@ class TaiwanDerivativesTrackerTaifex:
             res = requests.post(url, data=payload, headers=self.headers, timeout=10, verify=False)
             res.encoding = 'big5'
             lines = res.text.splitlines()
-            valid_lines = [line for line in lines if not line.startswith('※') and not line.startswith('單位')]
+            # 確保僅處理真實數據行
+            valid_lines = [line for line in lines if not line.startswith('※') and not line.startswith('單位') and len(line.split(',')) > 5]
+            if not valid_lines: return call_map, put_map
+            
             df = pd.read_csv(io.StringIO("\n".join(valid_lines)))
-            df.columns = df.columns.str.strip()
+            df.columns = df.columns.str.strip().str.replace(' ', '')
 
             date_col = next((c for c in df.columns if '日期' in c), None)
             prod_col = next((c for c in df.columns if '商品' in c), None)
+            cp_col = next((c for c in df.columns if '權別' in c or '買賣權' in c), None)
             id_col = next((c for c in df.columns if '身份' in c), None)
 
-            if date_col and prod_col and id_col:
+            # 透過精準欄位名稱抓取，徹底解決索引錯位問題
+            long_oi_col = next((c for c in df.columns if '買方' in c and '未平倉' in c and '口數' in c), None)
+            short_oi_col = next((c for c in df.columns if '賣方' in c and '未平倉' in c and '口數' in c), None)
+
+            if date_col and prod_col and id_col and long_oi_col and short_oi_col:
                 for d_val in df[date_col].unique():
                     dt = self.parse_taifex_date(d_val)
                     if not dt: continue
                     sub = df[df[date_col] == d_val]
                     
-                    # 依截圖：買權為「臺指選擇權」，賣權為「賣權」相關名稱
                     for _, r in sub.iterrows():
                         if '外資' in str(r[id_col]):
                             prod_name = str(r[prod_col])
+                            cp_name = str(r[cp_col]) if cp_col else ""
+                            # 將商品與權別結合判斷，避免只看「臺指選擇權」造成的互相覆蓋
+                            combo_name = prod_name + cp_name 
                             
-                            # 未平倉買方(口數) 與 未平倉賣方(口數)
-                            # 在 CSV 欄位順序中，買方OI 通常在 -4 或 -5 位置，賣方在 -2 位置
-                            # 直接拿數值計算：買方未平倉口數 - 賣方未平倉口數
-                            vals = [self.clean_num(v) for v in r.values if str(v).replace(',', '').replace('-', '').isdigit()]
-                            if len(vals) >= 6:
-                                long_oi = vals[-4]  # 買方未平倉
-                                short_oi = vals[-2] # 賣方未平倉
-                                net_oi = int(long_oi - short_oi)
-                                
-                                if '買權' in prod_name or '臺指選擇權' in prod_name:
-                                    call_map[dt] = net_oi
-                                elif '賣權' in prod_name:
-                                    put_map[dt] = net_oi
-        except Exception as e:
+                            long_oi = self.clean_num(r[long_oi_col])
+                            short_oi = self.clean_num(r[short_oi_col])
+                            net_oi = int(long_oi - short_oi)
+                            
+                            if '買權' in combo_name:
+                                call_map[dt] = net_oi
+                            elif '賣權' in combo_name:
+                                put_map[dt] = net_oi
+        except Exception:
             pass
         return call_map, put_map
 
@@ -317,37 +326,34 @@ class TaiwanDerivativesTrackerTaifex:
         """【精準對應期貨表】：計算三大法人淨額與全市場未平倉量"""
         url_inst = "https://www.taifex.com.tw/cht/3/futContractsDateDown"
         payload_inst = {"queryStartDate": d_start, "queryEndDate": d_end, "commodityId": cid}
-        
         url_daily = "https://www.taifex.com.tw/cht/3/futDataDown"
         payload_daily = {"queryStartDate": d_start, "queryEndDate": d_end, "commodity_id": cid, "down_type": "1"}
 
-        inst_net_map = {}
-        tot_oi_map = {}
+        inst_net_map, tot_oi_map = {}, {}
 
         # 1. 三大法人合計
         try:
             res = requests.post(url_inst, data=payload_inst, headers=self.headers, timeout=10, verify=False)
             res.encoding = 'big5'
-            lines = [l for l in res.text.splitlines() if not l.startswith('※') and not l.startswith('單位')]
-            df = pd.read_csv(io.StringIO("\n".join(lines)))
-            df.columns = df.columns.str.strip()
+            lines = [l for l in res.text.splitlines() if not l.startswith('※') and not l.startswith('單位') and len(l.split(',')) > 5]
+            if lines:
+                df = pd.read_csv(io.StringIO("\n".join(lines)))
+                df.columns = df.columns.str.strip().str.replace(' ', '')
 
-            date_col = next((c for c in df.columns if '日期' in c), None)
-            if date_col:
-                for d_val in df[date_col].unique():
-                    dt = self.parse_taifex_date(d_val)
-                    if not dt: continue
-                    sub = df[df[date_col] == d_val]
-                    
-                    total_inst_net = 0
-                    for _, r in sub.iterrows():
-                        # 擷取純數字欄位
-                        nums = [self.clean_num(v) for v in r.values if str(v).replace(',', '').replace('-', '').isdigit()]
-                        if len(nums) >= 4:
-                            long_oi = nums[-4]   # 多方未平倉
-                            short_oi = nums[-2]  # 空方未平倉
-                            total_inst_net += (long_oi - short_oi)
-                    inst_net_map[dt] = int(total_inst_net)
+                date_col = next((c for c in df.columns if '日期' in c), None)
+                long_oi_col = next((c for c in df.columns if '多方' in c and '未平倉' in c and '口數' in c), None)
+                short_oi_col = next((c for c in df.columns if '空方' in c and '未平倉' in c and '口數' in c), None)
+
+                if date_col and long_oi_col and short_oi_col:
+                    for d_val in df[date_col].unique():
+                        dt = self.parse_taifex_date(d_val)
+                        if not dt: continue
+                        sub = df[df[date_col] == d_val]
+                        
+                        total_inst_net = 0
+                        for _, r in sub.iterrows():
+                            total_inst_net += (self.clean_num(r[long_oi_col]) - self.clean_num(r[short_oi_col]))
+                        inst_net_map[dt] = int(total_inst_net)
         except:
             pass
 
@@ -355,26 +361,27 @@ class TaiwanDerivativesTrackerTaifex:
         try:
             res = requests.post(url_daily, data=payload_daily, headers=self.headers, timeout=10, verify=False)
             res.encoding = 'big5'
-            lines = [l for l in res.text.splitlines() if not l.startswith('※') and not l.startswith('單位')]
-            df = pd.read_csv(io.StringIO("\n".join(lines)))
-            df.columns = df.columns.str.strip()
+            lines = [l for l in res.text.splitlines() if not l.startswith('※') and not l.startswith('單位') and len(l.split(',')) > 5]
+            if lines:
+                df = pd.read_csv(io.StringIO("\n".join(lines)))
+                df.columns = df.columns.str.strip().str.replace(' ', '')
 
-            date_col = next((c for c in df.columns if '日期' in c), None)
-            session_col = next((c for c in df.columns if '時段' in c), None)
-            if date_col:
-                for d_val in df[date_col].unique():
-                    dt = self.parse_taifex_date(d_val)
-                    if not dt: continue
-                    sub = df[df[date_col] == d_val]
-                    if session_col:
-                        sub = sub[sub[session_col].astype(str).str.contains('一般', na=False)]
-                    
-                    tot_oi = 0
-                    for _, r in sub.iterrows():
-                        nums = [self.clean_num(v) for v in r.values if str(v).replace(',', '').isdigit()]
-                        if len(nums) > 0:
-                            tot_oi += nums[-1] # 最後一欄通常為未沖銷契約數
-                    tot_oi_map[dt] = int(tot_oi)
+                date_col = next((c for c in df.columns if '日期' in c), None)
+                session_col = next((c for c in df.columns if '時段' in c), None)
+                oi_col = next((c for c in df.columns if '未沖銷' in c), None)
+
+                if date_col and oi_col:
+                    for d_val in df[date_col].unique():
+                        dt = self.parse_taifex_date(d_val)
+                        if not dt: continue
+                        sub = df[df[date_col] == d_val]
+                        if session_col:
+                            sub = sub[sub[session_col].astype(str).str.contains('一般', na=False)]
+                        
+                        tot_oi = 0
+                        for _, r in sub.iterrows():
+                            tot_oi += self.clean_num(r[oi_col])
+                        tot_oi_map[dt] = int(tot_oi)
         except:
             pass
 
@@ -401,20 +408,17 @@ class TaiwanDerivativesTrackerTaifex:
         d1 = all_dates[0]
         d2 = all_dates[1] if len(all_dates) > 1 else d1
 
-        # 取值與算式
         pcr_1, pcr_2 = pcr_map.get(d1, 0.0), pcr_map.get(d2, 0.0)
         vix_1, vix_2 = vix_map.get(d1, 0.0), vix_map.get(d2, 0.0)
         fc_1, fc_2 = call_map.get(d1, 0), call_map.get(d2, 0)
         fp_1, fp_2 = put_map.get(d1, 0), put_map.get(d2, 0)
 
-        # 散戶淨額 = 全市場總OI - 三大法人淨額
         ret_m_1 = mtx_tot.get(d1, 0) - mtx_inst.get(d1, 0)
         ret_m_2 = mtx_tot.get(d2, 0) - mtx_inst.get(d2, 0)
 
         ret_t_1 = tmf_tot.get(d1, 0) - tmf_inst.get(d1, 0)
         ret_t_2 = tmf_tot.get(d2, 0) - tmf_inst.get(d2, 0)
 
-        # 多空比 = (散戶淨額 / 全市場總OI) * 100%
         rr_m_1 = (ret_m_1 / mtx_tot.get(d1, 1)) * 100 if mtx_tot.get(d1, 0) > 0 else 0.0
         rr_m_2 = (ret_m_2 / mtx_tot.get(d2, 1)) * 100 if mtx_tot.get(d2, 0) > 0 else 0.0
 
