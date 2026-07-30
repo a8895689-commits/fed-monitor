@@ -6,6 +6,11 @@ import yfinance as yf
 import requests
 import time
 import urllib.parse
+import datetime
+import io
+
+# 關閉 pandas 警告
+pd.options.mode.chained_assignment = None
 
 class LiveFedPredictor:
     """主題一：聯準會利率決策預測模組 (串接 FRED API)"""
@@ -94,14 +99,12 @@ class DailyMarketTracker:
         }
 
     def _safe_get_json(self, target_url):
-        """【神級破解法】自動輪替 Public API 代理伺服器繞過 GitHub IP 封鎖"""
         encoded_url = urllib.parse.quote(target_url, safe='')
         proxies = [
             target_url, 
             f"https://api.allorigins.win/raw?url={encoded_url}", 
             f"https://api.codetabs.com/v1/proxy?quest={target_url}" 
         ]
-        
         for p_url in proxies:
             try:
                 res = requests.get(p_url, headers=self.headers, timeout=12)
@@ -114,16 +117,15 @@ class DailyMarketTracker:
         return None
 
     def fetch_yfinance_prices(self):
-        """抓取美股、大盤指數、匯率、原油與美債期貨價格"""
         tickers = {
             "台股大盤": "^TWII",
             "費半指數": "^SOX",
             "輝達 NVDA": "NVDA",
             "台積電 ADR": "TSM",
-            "WTI 原油": "CL=F",            # 西德州原油期貨
-            "布蘭特原油": "BZ=F",          # 新增：布蘭特原油期貨
-            "10年美債(價格)": "ZN=F",      # 10年期公債期貨價格
-            "2年美債(價格)": "ZT=F",       # 2年期公債期貨價格
+            "WTI 原油": "CL=F",            
+            "布蘭特原油": "BZ=F",          
+            "10年美債(價格)": "ZN=F",      
+            "2年美債(價格)": "ZT=F",       
             "美元兌台幣": "TWD=X"
         }
         prices = {}
@@ -146,7 +148,6 @@ class DailyMarketTracker:
         return prices
 
     def fetch_treasury_yields(self):
-        """抓取 2年期與10年期美債『殖利率』 (串接 FRED API)"""
         base_url = "https://api.stlouisfed.org/fred/series/observations"
         yields = {}
         for name, series_id in [("2年美債(殖利率)", "DGS2"), ("10年美債(殖利率)", "DGS10")]:
@@ -162,8 +163,6 @@ class DailyMarketTracker:
                         pct_change = ((curr - prev) / prev) * 100
                         sign = "+" if pct_change > 0 else ""
                         yields[name] = f"{curr:.2f}% ({sign}{pct_change:.2f}%)"
-                    elif len(obs) == 1:
-                        yields[name] = f"{float(obs[0]['value']):.2f}% (N/A)"
                     else:
                         yields[name] = "N/A"
             except Exception:
@@ -171,19 +170,15 @@ class DailyMarketTracker:
         return yields
 
     def fetch_twse_institutional(self):
-        """抓取三大法人 (結合代理伺服器與防快取時間戳)"""
         timestamp = int(time.time()) 
         url = f"https://www.twse.com.tw/fund/BFI82U?response=json&type=day&_={timestamp}"
-        
         chips = {"外資及陸資": "N/A", "投信": "N/A", "自營商(自行)": "N/A", "自營商(避險)": "N/A"}
         data = self._safe_get_json(url)
-        
         try:
             if data and data.get('stat') == 'OK':
                 for row in data['data']:
                     name = row[0].strip()
                     net_buy = round(int(row[3].replace(',', '')) / 100000000, 2)
-                    
                     if "外資及陸資" in name: chips["外資及陸資"] = net_buy
                     elif "投信" in name: chips["投信"] = net_buy
                     elif "自營商(自行買賣)" in name: chips["自營商(自行)"] = net_buy
@@ -191,6 +186,182 @@ class DailyMarketTracker:
         except Exception:
             pass
         return chips
+
+
+class TaiwanOptionsTracker:
+    """主題三：台指選擇權莊家籌碼與痛點計算"""
+    def __init__(self):
+        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    def get_twse_close(self, date_str):
+        twse_date = date_str.replace('/', '') 
+        url = f"https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date={twse_date}&type=IND&response=json"
+        try:
+            res = requests.get(url, headers=self.headers, timeout=8)
+            data = res.json()
+            rows = data.get('data1', [])
+            if not rows and 'tables' in data:
+                for t in data['tables']:
+                    if 'data' in t: rows.extend(t['data'])
+            for row in rows:
+                if len(row) > 1 and '發行量加權股價指數' in str(row[0]):
+                    return float(str(row[1]).replace(',', ''))
+        except Exception:
+            # 備援機制：如果證交所阻擋，從 yfinance 抓取大盤
+            try:
+                hist = yf.Ticker("^TWII").history(period="5d")
+                return float(hist['Close'].iloc[-1])
+            except:
+                pass
+        return 0
+
+    def get_taifex_csv(self, date_obj):
+        date_str = date_obj.strftime("%Y/%m/%d")
+        url = "https://www.taifex.com.tw/cht/3/optDataDown"
+        payload = {
+            "down_type": "1", "commodity_id": "TXO", "commodity_id2": "",
+            "queryStartDate": date_str, "queryEndDate": date_str, "macrostype": "siron"
+        }
+        try:
+            response = requests.post(url, data=payload, headers=self.headers, timeout=10)
+            if response.status_code != 200: return pd.DataFrame()
+            response.encoding = 'big5'
+            csv_text = response.text
+            if len(csv_text) < 500 or "交易日期" not in csv_text: return pd.DataFrame()
+            return pd.read_csv(io.StringIO(csv_text))
+        except:
+            return pd.DataFrame()
+
+    def find_column(self, df, keywords):
+        for col in df.columns:
+            for kw in keywords:
+                if kw in col: return col
+        return None
+
+    def clean_df(self, df):
+        if df.empty: return df
+        df.columns = df.columns.str.strip().str.replace(' ', '')
+        for col in df.columns:
+            if df[col].dtype == 'object': df[col] = df[col].astype(str).str.strip()
+        contract_col = self.find_column(df, ['契約'])
+        session_col = self.find_column(df, ['時段'])
+        if contract_col: df = df[df[contract_col] == 'TXO']
+        if session_col: df = df[df[session_col].str.contains('一般', na=False)]
+        return df
+
+    def format_payout(self, total_pain_points):
+        points_10k = total_pain_points / 10000
+        cash_100m = (total_pain_points * 50) / 100000000 
+        return f"{points_10k:.2f}萬 ({cash_100m:.2f}億)"
+
+    def analyze_options(self):
+        today = datetime.datetime.now()
+        valid_dfs = {}
+        
+        # 尋找最近兩天的選擇權資料
+        for i in range(12):
+            test_date = today - datetime.timedelta(days=i)
+            df = self.get_taifex_csv(test_date)
+            if not df.empty:
+                date_str = test_date.strftime("%Y/%m/%d")
+                valid_dfs[date_str] = df
+            if len(valid_dfs) == 2:
+                break
+                
+        if len(valid_dfs) < 1:
+            return "⚠️ 無法取得期交所選擇權資料"
+
+        dates_found = list(valid_dfs.keys())
+        curr_date = dates_found[0]
+        curr_df = self.clean_df(valid_dfs[curr_date])
+        prev_df = self.clean_df(valid_dfs[dates_found[1]]) if len(dates_found) > 1 else pd.DataFrame()
+        taiex_close = self.get_twse_close(curr_date)
+
+        expiry_col = self.find_column(curr_df, ['到期', '月份'])
+        strike_col = self.find_column(curr_df, ['履約'])
+        cp_col = self.find_column(curr_df, ['買賣'])
+        oi_col = self.find_column(curr_df, ['未沖銷', '未平倉'])
+        
+        contracts = sorted(curr_df[expiry_col].unique())
+        all_results = []
+        
+        for c in contracts:
+            df_sub = curr_df[curr_df[expiry_col] == c].copy()
+            df_sub[strike_col] = pd.to_numeric(df_sub[strike_col], errors='coerce')
+            df_sub[oi_col] = pd.to_numeric(df_sub[oi_col].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
+            total_oi = df_sub[oi_col].sum()
+            if total_oi < 1000: continue
+                
+            prev_oi = 0
+            if not prev_df.empty:
+                prev_sub = prev_df[prev_df[expiry_col] == c].copy()
+                if not prev_sub.empty:
+                    prev_sub[oi_col] = pd.to_numeric(prev_sub[oi_col].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
+                    prev_oi = prev_sub[oi_col].sum()
+            oi_change = int(total_oi - prev_oi)
+            oi_change_str = f"+{oi_change}" if oi_change > 0 else str(oi_change)
+                
+            calls = df_sub[df_sub[cp_col].str.contains('Call|買', case=False)].set_index(strike_col)[oi_col].to_dict()
+            puts = df_sub[df_sub[cp_col].str.contains('Put|賣', case=False)].set_index(strike_col)[oi_col].to_dict()
+            
+            max_call_strike = max(calls, key=calls.get) if calls else "無"
+            max_put_strike = max(puts, key=puts.get) if puts else "無"
+            
+            strike_prices = sorted(df_sub[strike_col].dropna().unique())
+            pain_values = []
+            for settle_price in strike_prices:
+                total_pain = 0
+                for strike, oi in calls.items():
+                    if settle_price > strike: total_pain += (settle_price - strike) * oi
+                for strike, oi in puts.items():
+                    if settle_price < strike: total_pain += (strike - settle_price) * oi
+                pain_values.append({'Strike_Price': settle_price, 'Total_Pain': total_pain})
+                
+            pain_df = pd.DataFrame(pain_values)
+            if pain_df.empty or len(pain_df) < 3: continue
+                
+            sorted_pain = pain_df.sort_values(by='Total_Pain')
+            p1 = int(sorted_pain.iloc[0]['Strike_Price'])
+            p1_str = self.format_payout(sorted_pain.iloc[0]['Total_Pain'])
+            
+            # 近大盤痛點
+            if taiex_close > 0:
+                near_zone_df = pain_df[abs(pain_df['Strike_Price'] - taiex_close) <= 600]
+                if not near_zone_df.empty:
+                    near_row = near_zone_df.sort_values(by='Total_Pain').iloc[0]
+                    p_near = int(near_row['Strike_Price'])
+                    p_near_str = self.format_payout(near_row['Total_Pain'])
+                else:
+                    pain_df_copy = pain_df.copy()
+                    pain_df_copy['dist'] = abs(pain_df_copy['Strike_Price'] - taiex_close)
+                    near_row = pain_df_copy.sort_values(by='dist').iloc[0]
+                    p_near = int(near_row['Strike_Price'])
+                    p_near_str = self.format_payout(near_row['Total_Pain'])
+            else:
+                p_near = p1; p_near_str = p1_str
+            
+            all_results.append({
+                'contract': c, 'total_oi': int(total_oi), 'oi_change_str': oi_change_str,
+                'max_call': max_call_strike, 'max_put': max_put_strike,
+                'p1': p1, 'p1_str': p1_str, 'p_near': p_near, 'p_near_str': p_near_str
+            })
+            
+        all_results.sort(key=lambda x: x['total_oi'], reverse=True)
+        top_2 = all_results[:2]
+        
+        # 組合 LINE 專用的選擇權字串
+        msg = f"\n🎯 【台指選擇權莊家佈局】\n"
+        msg += f"📅 結算日資料: {curr_date}\n"
+        msg += f"📊 大盤收盤價: {taiex_close}\n"
+        
+        for idx, c in enumerate(top_2):
+            msg += f"\n📌 [合約: {c['contract']}]\n"
+            msg += f"• 總OI: {c['total_oi']} (增減 {c['oi_change_str']})\n"
+            msg += f"• 支撐(Put): {c['max_put']} | 壓力(Call): {c['max_call']}\n"
+            msg += f"• 主痛點: {c['p1']} [{c['p1_str']}]\n"
+            msg += f"• 近大盤痛點: {c['p_near']} [{c['p_near_str']}]\n"
+            
+        return msg
 
 
 def send_line_message(token, user_id, text):
@@ -215,19 +386,18 @@ if __name__ == "__main__":
 
     # 2. 抓取市場價格與籌碼數據
     market_bot = DailyMarketTracker(fred_api_key=FRED_API_KEY)
-    
-    # 2.1 合併股市與美債價格
     prices = market_bot.fetch_yfinance_prices()
     treasury_yields = market_bot.fetch_treasury_yields()
     prices.update(treasury_yields)
-    
-    # 2.2 抓取三大法人籌碼
     chips = market_bot.fetch_twse_institutional()
+    
+    # 3. 抓取台指選擇權莊家資料 (完全不需 Google Sheet)
+    opt_bot = TaiwanOptionsTracker()
+    opt_msg = opt_bot.analyze_options()
 
-    # 3. 組合 LINE 訊息 
+    # 4. 組合最終 LINE 訊息
     msg = "📊 【聯準會決策儀表板】\n"
     msg += f"📅 數據發布: {latest_date}\n\n"
-    
     for res in fed_results:
         msg += f"• {res['指標']}: {res['數值']} [{res['判定']}] (門檻: {res['門檻']})\n"
 
@@ -241,13 +411,13 @@ if __name__ == "__main__":
     
     msg += "\n💰 【台股三大法人籌碼】\n"
     for name, net_buy in chips.items():
-        if isinstance(net_buy, (int, float)):
-            icon = "🔴" if net_buy > 0 else ("🟢" if net_buy < 0 else "⚪")
-        else:
-            icon = "⚪"
-            
+        icon = "🔴" if isinstance(net_buy, (int, float)) and net_buy > 0 else ("🟢" if isinstance(net_buy, (int, float)) and net_buy < 0 else "⚪")
         msg += f"• {name}: {icon} {net_buy}\n"
+        
+    msg += "======================"
+    # 將選擇權訊息接在最後
+    msg += opt_msg
 
     # 送出 LINE 訊息
     send_line_message(LINE_ACCESS_TOKEN, LINE_USER_ID, msg)
-    print("✅ 執行完畢並成功推播！")
+    print("✅ 執行完畢並成功推播全部資訊！")
