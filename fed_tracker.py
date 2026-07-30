@@ -191,7 +191,7 @@ class DailyMarketTracker:
 
 
 class TaiwanDerivativesTrackerTaifex:
-    """主題三：台指期權進階籌碼 (三層防禦終極穩定版)"""
+    """主題三：台指期權進階籌碼 (嚴格日期過濾防護版)"""
     def __init__(self):
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -199,12 +199,46 @@ class TaiwanDerivativesTrackerTaifex:
             "Origin": "https://www.taifex.com.tw"
         }
 
+    @staticmethod
+    def parse_taifex_date(val):
+        """【關鍵核心】：嚴格日期解析器，排除大數值/未來的異常 Timestamp (如 2039/09/09)"""
+        if pd.isna(val): return None
+        s = str(val).strip().replace('-', '').replace('/', '').replace('.', '').split(' ')[0]
+        
+        if not s.isdigit(): return None
+        
+        # 1. 西元 8 碼: YYYYMMDD (例如 20240520)
+        if len(s) == 8:
+            try:
+                year, month, day = int(s[:4]), int(s[4:6]), int(s[6:8])
+                if 2000 <= year <= 2030 and 1 <= month <= 12 and 1 <= day <= 31:
+                    return f"{year:04d}/{month:02d}/{day:02d}"
+            except: pass
+            
+        # 2. 民國 7 碼: YYYMMDD (例如 1130520)
+        elif len(s) == 7:
+            try:
+                roc_year, month, day = int(s[:3]), int(s[3:5]), int(s[5:7])
+                year = roc_year + 1911
+                if 2000 <= year <= 2030 and 1 <= month <= 12 and 1 <= day <= 31:
+                    return f"{year:04d}/{month:02d}/{day:02d}"
+            except: pass
+
+        # 3. 民國 6 碼: YYMMDD
+        elif len(s) == 6:
+            try:
+                roc_year, month, day = int(s[:2]), int(s[2:4]), int(s[4:6])
+                year = roc_year + 1911
+                if 2000 <= year <= 2030 and 1 <= month <= 12 and 1 <= day <= 31:
+                    return f"{year:04d}/{month:02d}/{day:02d}"
+            except: pass
+
+        return None
+
     def get_taifex_csv(self, url, payload):
         try:
-            # 1. 嘗試 POST 請求
             res = requests.post(url, data=payload, headers=self.headers, timeout=10, verify=False)
             if res.status_code != 200 or not res.text.strip() or "<html" in res.text.lower():
-                # 2. 嘗試 GET 備援
                 query_str = urllib.parse.urlencode(payload)
                 res = requests.get(f"{url}?{query_str}", headers=self.headers, timeout=10, verify=False)
 
@@ -223,11 +257,9 @@ class TaiwanDerivativesTrackerTaifex:
             
             if '日期' not in df.columns: return pd.DataFrame()
             
-            # 日期安全解析 (相容 YYYYMMDD / YYYY/MM/DD / YYYY-MM-DD)
-            raw_dates = df['日期'].astype(str).str.replace('-', '').str.replace('/', '').str.strip()
-            df['日期'] = pd.to_datetime(raw_dates, format='%Y%m%d', errors='coerce')
+            # 使用嚴格日期解析器過濾
+            df['日期'] = df['日期'].apply(self.parse_taifex_date)
             df = df.dropna(subset=['日期'])
-            df['日期'] = df['日期'].dt.strftime('%Y/%m/%d')
             
             for col in df.columns:
                 if df[col].dtype == 'object': 
@@ -237,7 +269,6 @@ class TaiwanDerivativesTrackerTaifex:
             return pd.DataFrame()
 
     def fetch_pcr_fallback(self):
-        """三層防禦：若官網 CSV 下載完全失敗，自動呼叫期交所官方開放 API (OpenAPI)"""
         try:
             url = "https://openapi.taifex.com.tw/v1/Daily_PCRatio"
             res = requests.get(url, headers=self.headers, timeout=10, verify=False)
@@ -246,18 +277,19 @@ class TaiwanDerivativesTrackerTaifex:
                 df = pd.DataFrame(data)
                 if df.empty: return pd.DataFrame()
                 
-                # 欄位自動適應映射
                 col_map = {}
                 for c in df.columns:
-                    if c.lower() in ['date', '日期']: col_map[c] = '日期'
-                    elif 'ratio' in c.lower() or '比率' in c: col_map[c] = '買賣權未平倉量比率%'
+                    c_lower = c.lower()
+                    if c_lower in ['date', '日期', 'txdate']: 
+                        col_map[c] = '日期'
+                    elif 'ratio' in c_lower or '比率' in c: 
+                        if 'open' in c_lower or '未平倉' in c or 'putcallratio' in c_lower:
+                            col_map[c] = '買賣權未平倉量比率%'
                 
                 df.rename(columns=col_map, inplace=True)
                 if '日期' in df.columns:
-                    raw_dates = df['日期'].astype(str).str.replace('-', '').str.replace('/', '').str.strip()
-                    df['日期'] = pd.to_datetime(raw_dates, format='%Y%m%d', errors='coerce')
+                    df['日期'] = df['日期'].apply(self.parse_taifex_date)
                     df = df.dropna(subset=['日期'])
-                    df['日期'] = df['日期'].dt.strftime('%Y/%m/%d')
                     return df
         except:
             pass
@@ -273,12 +305,12 @@ class TaiwanDerivativesTrackerTaifex:
         def pl_inst(cid): return {"queryStartDate": d_start, "queryEndDate": d_end, "commodityId": cid}
         def pl_daily(cid): return {"queryStartDate": d_start, "queryEndDate": d_end, "commodity_id": cid, "down_type": "1"}
 
-        # 1. 抓取 PCR (先嘗試官網 CSV，失敗則切換至官方 OpenAPI)
+        # 1. 抓取 PCR
         df_pcr = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/pcRatioDown", pl_pcr())
         if df_pcr.empty or '日期' not in df_pcr.columns:
             df_pcr = self.fetch_pcr_fallback()
 
-        # 2. 抓取外資選擇權與期貨數據
+        # 2. 抓取三大法人選擇權與期貨資料
         df_opt = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/callsAndPutsDateDown", pl_inst("TXO"))
         df_mtx_inst = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futContractsDateDown", pl_inst("MTX"))
         df_tmf_inst = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futContractsDateDown", pl_inst("TMF"))
@@ -301,24 +333,23 @@ class TaiwanDerivativesTrackerTaifex:
                         break
                         
                 if '日期' in d.columns and '收盤指數' in d.columns:
-                    raw_dates = d['日期'].astype(str).str.replace('-', '').str.replace('/', '').str.strip()
-                    d['日期'] = pd.to_datetime(raw_dates, format='%Y%m%d', errors='coerce')
+                    d['日期'] = d['日期'].apply(self.parse_taifex_date)
                     d = d.dropna(subset=['日期'])
-                    d['日期'] = d['日期'].dt.strftime('%Y/%m/%d')
                     df_vix = d
                     break
         except:
             pass
 
-        # 動態尋找最新交易日期 (確保哪怕某一介面失效也不會崩潰)
-        dates = []
-        for df in [df_pcr, df_opt, df_mtx_inst]:
+        # 彙整所有表格中的有效日期
+        valid_dates = set()
+        for df in [df_pcr, df_opt, df_mtx_inst, df_tmf_inst, df_mtx_daily, df_tmf_daily]:
             if not df.empty and '日期' in df.columns:
-                dates = sorted(df['日期'].unique(), reverse=True)
-                if len(dates) > 0: break
+                for d in df['日期'].unique():
+                    if d: valid_dates.add(d)
 
+        dates = sorted(list(valid_dates), reverse=True)
         if len(dates) == 0:
-            return "\n⚠️ 期交所目前伺服器連線異常，請稍後再試\n"
+            return "\n⚠️ 期交所目前伺服器連線異常或無有效資料，請稍後再試\n"
 
         d1 = dates[0]
         d2 = dates[1] if len(dates) > 1 else d1 
@@ -326,25 +357,30 @@ class TaiwanDerivativesTrackerTaifex:
         # ===== 安全數值轉換處理 =====
         def s_int(val): 
             try:
+                if pd.isna(val): return 0
                 v = str(val).replace(',', '').strip()
-                return int(v) if v and v not in ('-', '') else 0
+                if not v or v in ('-', 'N/A', 'nan', 'NaN', 'null'): return 0
+                return int(float(v))
             except:
                 return 0
 
         def s_flt(val): 
             try:
-                v = str(val).replace(',', '').strip()
-                return float(v) if v and v not in ('-', '') else 0.0
+                if pd.isna(val): return 0.0
+                v = str(val).replace(',', '').replace('%', '').strip()
+                if not v or v in ('-', 'N/A', 'nan', 'NaN', 'null'): return 0.0
+                res = float(v)
+                return 0.0 if pd.isna(res) else res
             except:
                 return 0.0
 
-        # ===== 資料提取與計算 =====
         def get_pcr(d_str):
             if df_pcr.empty: return 0.0
             sub = df_pcr[df_pcr['日期'] == d_str]
-            pcr_col = next((c for c in df_pcr.columns if '未平倉' in c and ('比率' in c or 'Ratio' in c)), None)
-            if not pcr_col: pcr_col = next((c for c in df_pcr.columns if '比率' in c or 'Ratio' in c), None)
-            return s_flt(sub[pcr_col].values[0]) if not sub.empty and pcr_col else 0.0
+            if sub.empty: return 0.0
+            pcr_col = next((c for c in sub.columns if '未平倉' in c and ('比率' in c or 'ratio' in c.lower())), None)
+            if not pcr_col: pcr_col = next((c for c in sub.columns if '比率' in c or 'ratio' in c.lower() or 'pcr' in c.lower()), None)
+            return s_flt(sub[pcr_col].values[0]) if pcr_col else 0.0
 
         def get_vix(d_str):
             if df_vix.empty: return 0.0
@@ -353,29 +389,35 @@ class TaiwanDerivativesTrackerTaifex:
 
         def get_opt_foreign(d_str, cp):
             if df_opt.empty: return 0
-            cp_col = next((col for col in df_opt.columns if '買賣權' in col), None)
-            if not cp_col: return 0
+            cp_col = next((col for col in df_opt.columns if '買賣' in col), None)
+            id_col = next((col for col in df_opt.columns if '身份' in col), None)
+            net_col = next((c for c in df_opt.columns if '淨額' in c or '未平倉淨' in c), None)
+            
+            if not cp_col or not id_col or not net_col: return 0
             
             sub = df_opt[(df_opt['日期'] == d_str) & 
-                         (df_opt['身份別'].astype(str).str.contains('外資', na=False)) & 
+                         (df_opt[id_col].astype(str).str.contains('外資', na=False)) & 
                          (df_opt[cp_col].astype(str).str.contains(cp, na=False))]
-                         
-            net_col = next((c for c in df_opt.columns if '未平倉淨' in c), None)
-            if not net_col: net_col = next((c for c in df_opt.columns if '淨額' in c), None)
-            
-            return s_int(sub[net_col].values[0]) if not sub.empty and net_col else 0
+            return s_int(sub[net_col].values[0]) if not sub.empty else 0
 
         def get_ret_net(df, d_str):
             if df.empty: return 0
             sub = df[df['日期'] == d_str] 
-            net_col = next((c for c in df.columns if '未平倉淨' in c), None)
-            if not net_col: net_col = next((c for c in df.columns if '淨額' in c), None)
-            if not net_col: return 0
-            return -sum([s_int(x) for x in sub[net_col].values]) if not sub.empty else 0
+            if sub.empty: return 0
+            net_col = next((c for c in df.columns if '淨額' in c or '未平倉淨' in c), None)
+            if net_col: return -sum([s_int(x) for x in sub[net_col].values])
+            
+            long_col = next((c for c in df.columns if '多方' in c and '未平倉' in c), None)
+            short_col = next((c for c in df.columns if '空方' in c and '未平倉' in c), None)
+            if long_col and short_col:
+                inst_net = sum([s_int(r[long_col]) - s_int(r[short_col]) for _, r in sub.iterrows()])
+                return -inst_net
+            return 0
 
         def get_tot(df, d_str):
             if df.empty: return 1
             sub = df[df['日期'] == d_str] 
+            if sub.empty: return 1
             if '交易時段' in sub.columns: 
                 sub = sub[sub['交易時段'].astype(str).str.contains('一般', na=False)] 
             oi_col = next((c for c in df.columns if '未沖銷' in c or '未平倉' in c), None)
@@ -395,10 +437,10 @@ class TaiwanDerivativesTrackerTaifex:
         tm_1, tm_2 = get_tot(df_mtx_daily, d1), get_tot(df_mtx_daily, d2)
         tt_1, tt_2 = get_tot(df_tmf_daily, d1), get_tot(df_tmf_daily, d2)
 
-        rr_m_1 = (rm_1 / tm_1) * 100 if tm_1 > 1 else 0.0
-        rr_m_2 = (rm_2 / tm_2) * 100 if tm_2 > 1 else 0.0
-        rr_t_1 = (rt_1 / tt_1) * 100 if tt_1 > 1 else 0.0
-        rr_t_2 = (rt_2 / tt_2) * 100 if tt_2 > 1 else 0.0
+        rr_m_1 = (rm_1 / tm_1) * 100 if tm_1 > 0 else 0.0
+        rr_m_2 = (rm_2 / tm_2) * 100 if tm_2 > 0 else 0.0
+        rr_t_1 = (rt_1 / tt_1) * 100 if tt_1 > 0 else 0.0
+        rr_t_2 = (rt_2 / tt_2) * 100 if tt_2 > 0 else 0.0
 
         # ===== 格式化訊息 =====
         def s_str(v): return f"+{v}" if v > 0 else str(v)
