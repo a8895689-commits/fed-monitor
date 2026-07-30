@@ -97,9 +97,9 @@ class DailyMarketTracker:
         """【神級破解法】自動輪替 Public API 代理伺服器繞過 GitHub IP 封鎖"""
         encoded_url = urllib.parse.quote(target_url, safe='')
         proxies = [
-            target_url,  # 1. 先嘗試直接連線
-            f"https://api.allorigins.win/raw?url={encoded_url}",  # 2. 透過 AllOrigins 代理
-            f"https://api.codetabs.com/v1/proxy?quest={target_url}" # 3. 透過 CodeTabs 代理
+            target_url, 
+            f"https://api.allorigins.win/raw?url={encoded_url}", 
+            f"https://api.codetabs.com/v1/proxy?quest={target_url}" 
         ]
         
         for p_url in proxies:
@@ -107,7 +107,6 @@ class DailyMarketTracker:
                 res = requests.get(p_url, headers=self.headers, timeout=12)
                 if res.status_code == 200:
                     data = res.json()
-                    # 確認回傳的 JSON 是有效的證交所或 FinMind 格式
                     if isinstance(data, dict) and ('stat' in data or 'msg' in data):
                         return data
             except Exception:
@@ -115,10 +114,16 @@ class DailyMarketTracker:
         return None
 
     def fetch_yfinance_prices(self):
-        """抓取美股、大盤指數與匯率"""
+        """抓取美股、大盤指數、匯率、原油與美債期貨價格"""
         tickers = {
-            "台股大盤": "^TWII", "費半指數": "^SOX", "輝達 NVDA": "NVDA",
-            "台積電 ADR": "TSM", "美元兌台幣": "TWD=X"
+            "台股大盤": "^TWII",
+            "費半指數": "^SOX",
+            "輝達 NVDA": "NVDA",
+            "台積電 ADR": "TSM",
+            "WTI 原油": "CL=F",            # 新增：西德州原油期貨
+            "10年美債(價格)": "ZN=F",      # 新增：10年期公債期貨價格
+            "2年美債(價格)": "TU=F",       # 新增：2年期公債期貨價格
+            "美元兌台幣": "TWD=X"
         }
         prices = {}
         for name, symbol in tickers.items():
@@ -140,10 +145,10 @@ class DailyMarketTracker:
         return prices
 
     def fetch_treasury_yields(self):
-        """抓取 2年期與10年期美債殖利率 (串接 FRED API)"""
+        """抓取 2年期與10年期美債『殖利率』 (串接 FRED API)"""
         base_url = "https://api.stlouisfed.org/fred/series/observations"
         yields = {}
-        for name, series_id in [("2年美債", "DGS2"), ("10年美債", "DGS10")]:
+        for name, series_id in [("2年美債(殖利率)", "DGS2"), ("10年美債(殖利率)", "DGS10")]:
             url = f"{base_url}?series_id={series_id}&api_key={self.fred_api_key}&file_type=json&sort_order=desc&limit=5&units=lin"
             try:
                 req = urllib.request.Request(url, headers=self.headers)
@@ -155,9 +160,9 @@ class DailyMarketTracker:
                         prev = float(obs[1]['value'])
                         pct_change = ((curr - prev) / prev) * 100
                         sign = "+" if pct_change > 0 else ""
-                        yields[name] = f"{curr:.2f} ({sign}{pct_change:.2f}%)"
+                        yields[name] = f"{curr:.2f}% ({sign}{pct_change:.2f}%)"
                     elif len(obs) == 1:
-                        yields[name] = f"{float(obs[0]['value']):.2f} (N/A)"
+                        yields[name] = f"{float(obs[0]['value']):.2f}% (N/A)"
                     else:
                         yields[name] = "N/A"
             except Exception:
@@ -166,7 +171,7 @@ class DailyMarketTracker:
 
     def fetch_twse_institutional(self):
         """抓取三大法人 (結合代理伺服器與防快取時間戳)"""
-        timestamp = int(time.time()) # 加入時間戳避免抓到舊資料
+        timestamp = int(time.time()) 
         url = f"https://www.twse.com.tw/fund/BFI82U?response=json&type=day&_={timestamp}"
         
         chips = {"外資及陸資": "N/A", "投信": "N/A", "自營商(自行)": "N/A", "自營商(避險)": "N/A"}
@@ -182,39 +187,42 @@ class DailyMarketTracker:
                     elif "投信" in name: chips["投信"] = net_buy
                     elif "自營商(自行買賣)" in name: chips["自營商(自行)"] = net_buy
                     elif "自營商(避險)" in name: chips["自營商(避險)"] = net_buy
-            else:
-                chips = {k: "N/A (遭防護阻擋)" for k in chips}
         except Exception:
             pass
         return chips
 
     def fetch_margin_balance(self):
-        """抓取融資融券 (結合代理伺服器繞過 FinMind 流量限制)"""
+        """改用台灣證交所官方 API 抓取大盤總融資融券"""
         chips = {"融資餘額(億)": "N/A", "融券餘額(萬張)": "N/A"}
-        start_date = (pd.Timestamp.now() - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
         timestamp = int(time.time())
-        url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockTotalMarginPurchaseShortSale&start_date={start_date}&_={timestamp}"
+        # 使用證交所官方的「信用交易統計」API，不帶日期會自動回傳最新可用的交易日
+        url = f"https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&selectType=MS&_={timestamp}"
         
         data = self._safe_get_json(url)
         try:
-            if data and data.get("msg") == "success" and len(data.get("data", [])) >= 2:
-                latest = data["data"][-1]
-                prev = data["data"][-2]
+            if data and data.get('stat') == 'OK':
+                # 在回傳的資料中尋找含有關鍵字的陣列
+                margin_row = next((row for row in data['data'] if "融資金額" in row[0]), None)
+                short_row = next((row for row in data['data'] if "融券" in row[0] and "金額" not in row[0]), None)
                 
-                mb = latest["MarginPurchaseTodayBalance"] / 100000000
-                mb_diff = (latest["MarginPurchaseTodayBalance"] - prev["MarginPurchaseTodayBalance"]) / 100000000
-                sign_m = "+" if mb_diff > 0 else ""
-                chips["融資餘額(億)"] = f"{mb:.2f} ({sign_m}{mb_diff:.2f})"
-                
-                sb = latest["ShortSaleTodayBalance"] / 10000
-                sb_diff = (latest["ShortSaleTodayBalance"] - prev["ShortSaleTodayBalance"]) / 10000
-                sign_s = "+" if sb_diff > 0 else ""
-                chips["融券餘額(萬張)"] = f"{sb:.2f} ({sign_s}{sb_diff:.2f})"
-            else:
-                chips["融資餘額(億)"] = "N/A (遭防護阻擋)"
-                chips["融券餘額(萬張)"] = "N/A (遭防護阻擋)"
-        except Exception:
+                if margin_row:
+                    # 證交所原始單位為「仟元」，除以 10萬 轉換為「億元」
+                    today_margin = int(margin_row[5].replace(',', '')) / 100000
+                    prev_margin = int(margin_row[4].replace(',', '')) / 100000
+                    diff_margin = today_margin - prev_margin
+                    sign_m = "+" if diff_margin > 0 else ""
+                    chips["融資餘額(億)"] = f"{today_margin:.2f} ({sign_m}{diff_margin:.2f})"
+                    
+                if short_row:
+                    # 證交所原始單位為「張」，除以 1萬 轉換為「萬張」
+                    today_short = int(short_row[5].replace(',', '')) / 10000
+                    prev_short = int(short_row[4].replace(',', '')) / 10000
+                    diff_short = today_short - prev_short
+                    sign_s = "+" if diff_short > 0 else ""
+                    chips["融券餘額(萬張)"] = f"{today_short:.2f} ({sign_s}{diff_short:.2f})"
+        except Exception as e:
             pass
+            
         return chips
 
 
