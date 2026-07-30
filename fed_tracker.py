@@ -138,39 +138,64 @@ class DailyMarketTracker:
             chips = {k: "N/A (遭阻擋)" for k in chips}
         return chips
 
-    def fetch_twse_margin(self):
-        """新增：抓取台灣證交所融資融券餘額與單日增減"""
-        url = "https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&selectType=MS"
+    def fetch_finmind_margin(self, token=""):
+        """改用 FinMind API 抓取大盤融資融券餘額與單日增減"""
+        # 往回抓 10 天確保跨過連假能拿到最新交易日資料
+        end_date = pd.Timestamp.today().strftime('%Y-%m-%d')
+        start_date = (pd.Timestamp.today() - pd.Timedelta(days=10)).strftime('%Y-%m-%d')
+        
+        url = "https://api.finmindtrade.com/api/v4/data"
+        parameter = {
+            "dataset": "TaiwanStockTotalMarginPurchaseShortSale",
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+        
+        # 如果有傳入 Token，就把它加進參數裡
+        if token:
+            parameter["token"] = token
+            
         margin_data = {
             "融資餘額(億)": "N/A", 
             "融券餘額(萬張)": "N/A", 
-            "融資維持率": "N/A(官方無提供)"
+            "融資維持率": "N/A (FinMind需付費)"
         }
+        
         try:
-            res = requests.get(url, headers=self.headers, timeout=5)
+            res = requests.get(url, params=parameter, timeout=10)
             data = res.json()
-            if data.get('stat') == 'OK':
-                for row in data.get('data', []):
-                    # 抓取融資金額 (單位: 仟元 -> 轉換為 億)
-                    if row[0] == '融資金額(仟元)':
-                        prev_bal = int(row[4].replace(',', ''))
-                        curr_bal = int(row[5].replace(',', ''))
-                        diff = (curr_bal - prev_bal) / 100000
-                        curr_bal_yi = curr_bal / 100000
-                        sign = "+" if diff > 0 else ""
-                        # 回傳格式: 今日餘額 (增減)
-                        margin_data["融資餘額(億)"] = f"{curr_bal_yi:.2f} ({sign}{diff:.2f})"
-                        
-                    # 抓取融券張數 (單位: 張 -> 轉換為 萬張)
-                    elif row[0] == '融券(交易單位)':
-                        prev_bal = int(row[4].replace(',', ''))
-                        curr_bal = int(row[5].replace(',', ''))
-                        diff = (curr_bal - prev_bal) / 10000
-                        curr_bal_wan = curr_bal / 10000
-                        sign = "+" if diff > 0 else ""
-                        margin_data["融券餘額(萬張)"] = f"{curr_bal_wan:.2f} ({sign}{diff:.2f})"
-        except Exception:
+            if data.get('msg') == 'success' and len(data.get('data', [])) > 0:
+                # 轉為 DataFrame 後抓取最後一筆 (最新交易日)
+                df = pd.DataFrame(data['data'])
+                df = df.sort_values("date")
+                latest = df.iloc[-1]
+                
+                # 處理融資餘額 (單位：仟元，需轉為億)
+                curr_margin = float(latest["MarginPurchaseTodayBalance"])
+                prev_margin = float(latest["MarginPurchaseYesterdayBalance"])
+                diff_margin = curr_margin - prev_margin
+                
+                # 防呆：若資料庫單位為元，動態調整分母
+                divisor_margin = 100000000 if curr_margin > 10000000000 else 100000 
+                curr_margin_yi = curr_margin / divisor_margin
+                diff_margin_yi = diff_margin / divisor_margin
+                sign_m = "+" if diff_margin_yi > 0 else ""
+                margin_data["融資餘額(億)"] = f"{curr_margin_yi:.2f} ({sign_m}{diff_margin_yi:.2f})"
+                
+                # 處理融券餘額 (單位：張，需轉為萬張)
+                curr_short = float(latest["ShortSaleTodayBalance"])
+                prev_short = float(latest["ShortSaleYesterdayBalance"])
+                diff_short = curr_short - prev_short
+                
+                curr_short_wan = curr_short / 10000
+                diff_short_wan = diff_short / 10000
+                sign_s = "+" if diff_short_wan > 0 else ""
+                margin_data["融券餘額(萬張)"] = f"{curr_short_wan:.2f} ({sign_s}{diff_short_wan:.2f})"
+                
+        except Exception as e:
+            # 發生例外時，字典中預設的 'N/A' 會傳遞給使用者
             pass
+            
         return margin_data
 
 
@@ -181,13 +206,15 @@ def send_line_message(token, user_id, text):
     req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers, method='POST')
     urllib.request.urlopen(req)
 
+
 if __name__ == "__main__":
     FRED_API_KEY = os.environ.get("FRED_API_KEY")
     LINE_ACCESS_TOKEN = os.environ.get("LINE_ACCESS_TOKEN")
     LINE_USER_ID = os.environ.get("LINE_USER_ID")
+    FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")  # 讀取 GitHub Secret 中的 FinMind Token
 
     if not all([FRED_API_KEY, LINE_ACCESS_TOKEN, LINE_USER_ID]):
-        print("❌ 錯誤：找不到環境變數")
+        print("❌ 錯誤：找不到環境變數 (FRED_API_KEY, LINE_ACCESS_TOKEN, LINE_USER_ID)")
         exit(1)
 
     # 1. 抓取美聯儲數據 (包含最新更新日期)
@@ -199,8 +226,8 @@ if __name__ == "__main__":
     prices = market_bot.fetch_yfinance_prices()
     chips = market_bot.fetch_twse_institutional()
     
-    # 2.5 新增：抓取融資融券數據並合併進籌碼字典中
-    margin_data = market_bot.fetch_twse_margin()
+    # 2.5 呼叫 FinMind 取得大盤融資融券並更新進字典，傳入 token 提升穩定度與權限
+    margin_data = market_bot.fetch_finmind_margin(token=FINMIND_TOKEN)
     chips.update(margin_data)
 
     # 3. 組合 LINE 訊息 
@@ -220,11 +247,14 @@ if __name__ == "__main__":
     
     msg += "\n💰 【台股現貨與信用籌碼】\n"
     for name, net_buy in chips.items():
-        icon = "🔴" if isinstance(net_buy, (int, float)) and net_buy > 0 else ("🟢" if isinstance(net_buy, (int, float)) and net_buy < 0 else "⚪")
+        # 若是外資等買超單位為 float / int 就給紅綠燈，字串(N/A或無資料)就給白燈
+        if isinstance(net_buy, (int, float)):
+            icon = "🔴" if net_buy > 0 else ("🟢" if net_buy < 0 else "⚪")
+        else:
+            icon = "⚪"
         msg += f"• {name}: {icon} {net_buy}\n"
         
-    # 因已加入信用交易籌碼，一併為您調整了此處的備註文字，使其更貼合現狀
-    msg += "\n(註: 大盤融資維持率無官方直接提供之API；期貨未平倉因資安限制暫以現貨為主。)"
+    msg += "\n(註: 大盤融資維持率 FinMind 需付費權限；期貨未平倉因資安限制暫以現貨為主。)"
 
     # 送出 LINE 訊息
     send_line_message(LINE_ACCESS_TOKEN, LINE_USER_ID, msg)
