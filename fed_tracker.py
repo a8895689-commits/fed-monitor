@@ -198,14 +198,22 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class TaiwanDerivativesTrackerTaifex:
-    """主題三：台指期權進階籌碼 (修正版)"""
+    """主題三：台指期權進階籌碼 (Cookie突破與精準除錯版)"""
     def __init__(self):
-        # 修正：補上關鍵的 Origin 與精準的防阻擋 Headers
+        # 1. 建立 Session 來維持 Cookie
+        self.session = requests.Session()
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Origin": "https://www.taifex.com.tw",
-            "Referer": "https://www.taifex.com.tw/cht/3/pcRatio"
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+            "Origin": "https://www.taifex.com.tw"
         }
+        
+        # 2. 初始化時，先假裝去首頁逛一下，取得期交所發的 Session Cookie
+        try:
+            self.session.get("https://www.taifex.com.tw/cht/index", headers=self.headers, timeout=5, verify=False)
+        except:
+            pass
 
     @staticmethod
     def clean_num(val):
@@ -242,11 +250,12 @@ class TaiwanDerivativesTrackerTaifex:
         if referer_url:
             headers["Referer"] = referer_url
         try:
-            res = requests.post(url, data=payload, headers=headers, timeout=10, verify=False)
+            # 3. 使用 self.session 發送請求，自動帶上 Cookie
+            res = self.session.post(url, data=payload, headers=headers, timeout=10, verify=False)
             res.encoding = 'big5'
             return res.text
-        except:
-            return ""
+        except Exception as e:
+            return f"Exception Error: {e}"
 
     def fetch_data(self):
         today = datetime.datetime.now()
@@ -254,7 +263,7 @@ class TaiwanDerivativesTrackerTaifex:
         d_start = start_date.strftime("%Y/%m/%d")
         d_end = today.strftime("%Y/%m/%d")
 
-        # 1. 抓取 PCR 資料 (此 API 仍支援區間查詢，但需補正 Referer)
+        # 抓取 PCR 資料
         pcr_text = self._fetch_raw_text(
             "https://www.taifex.com.tw/cht/3/pcRatioDown", 
             {"queryStartDate": d_start, "queryEndDate": d_end},
@@ -273,30 +282,28 @@ class TaiwanDerivativesTrackerTaifex:
                     for _, r in df.iterrows():
                         dt = self.parse_taifex_date(r[date_c])
                         if dt: pcr_map[dt] = self.clean_num(r[ratio_c])
-        except Exception as e:
-            print(f"PCR 解析錯誤: {e}")
+        except Exception:
+            pass
 
-        # 2 & 3. 抓取外資選擇權與小台籌碼 (修正：改用單日 queryDate 迴圈尋找有效交易日)
+        # 抓取外資選擇權與小台籌碼 (單日 queryDate 迴圈)
         call_map, put_map = {}, {}
         mtx_inst, mtx_tot = {}, {}
         
         valid_days_found = 0
-        for i in range(15):  # 往前掃描 15 天尋找最近的 2 個有開盤的交易日
+        for i in range(15):  
             test_date = today - datetime.timedelta(days=i)
             date_str = test_date.strftime("%Y/%m/%d")
             
-            # 修正：三大法人選擇權分計，改帶參數 queryDate
+            # 三大法人選擇權分計
             opt_text = self._fetch_raw_text(
                 "https://www.taifex.com.tw/cht/3/callsAndPutsDateDown", 
                 {"queryDate": date_str, "commodityId": "TXO"},
                 referer_url="https://www.taifex.com.tw/cht/3/callsAndPutsDate"
             )
             
-            # 判斷是否遇到假日或未開盤
             if not opt_text or "html" in opt_text.lower() or "查無資料" in opt_text:
                 continue
                 
-            # 解析外資選擇權
             try:
                 lines = [l for l in opt_text.splitlines() if not l.startswith('※') and not l.startswith('單位') and len(l.split(',')) > 5]
                 df = pd.read_csv(io.StringIO("\n".join(lines)), on_bad_lines='skip')
@@ -318,7 +325,7 @@ class TaiwanDerivativesTrackerTaifex:
             except:
                 continue
 
-            # 修正：小台三大法人未平倉，改帶參數 queryDate
+            # 小台三大法人未平倉
             inst_text = self._fetch_raw_text(
                 "https://www.taifex.com.tw/cht/3/futContractsDateDown", 
                 {"queryDate": date_str, "commodityId": "MXF"},
@@ -336,7 +343,7 @@ class TaiwanDerivativesTrackerTaifex:
                         mtx_inst[dt] = int(sum(self.clean_num(r[long_c]) - self.clean_num(r[short_c]) for _, r in df.iterrows()))
             except: pass
 
-            # 修正：小台全市場行情未平倉，改帶參數 queryDate
+            # 小台全市場行情未平倉
             daily_text = self._fetch_raw_text(
                 "https://www.taifex.com.tw/cht/3/futDataDown", 
                 {"queryDate": date_str, "commodity_id": "MXF", "down_type": "1"},
@@ -356,19 +363,19 @@ class TaiwanDerivativesTrackerTaifex:
                         mtx_tot[dt] = int(sum(self.clean_num(r[oi_c]) for _, r in df.iterrows()))
             except: pass
 
-            # 成功記錄完一天的必要數據後，計數器 + 1
             dt_check = self.parse_taifex_date(date_str)
             if dt_check in mtx_tot and dt_check in call_map:
                 valid_days_found += 1
             
-            # 抓滿最近的 2 個有效交易日就可停止，避免過度請求被封鎖
             if valid_days_found >= 2:
                 break
 
         all_dates = sorted(list(set(list(call_map.keys()) + list(mtx_tot.keys()))), reverse=True)
 
+        # 4. 關鍵修正：若抓不到資料，直接印出伺服器回傳的前 150 個字元，取代原本無意義的長度
         if len(all_dates) < 1:
-            return f"\n⚠️ 期交所連線遭拒或無數據。原始回傳前50字元診斷: [PCR文字長度:{len(pcr_text)}]\n"
+            error_snippet = pcr_text[:150].replace('\n', ' ') if pcr_text else "完全無回傳值"
+            return f"\n⚠️ 期交所拒絕連線。\n👉 伺服器實際回傳內容片段：\n[{error_snippet}...]\n"
 
         d1 = all_dates[0]
         d2 = all_dates[1] if len(all_dates) > 1 else d1
