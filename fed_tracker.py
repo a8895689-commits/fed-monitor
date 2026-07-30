@@ -12,17 +12,22 @@ class LiveFedPredictor:
         self.base_url = "https://api.stlouisfed.org/fred/series/observations"
 
     def _get_latest_obs(self, series_id, units="lin"):
+        """修改為抓取最新『兩筆』有效資料，以計算漲跌幅"""
         url = f"{self.base_url}?series_id={series_id}&api_key={self.api_key}&file_type=json&sort_order=desc&limit=10&units={units}"
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req) as response:
                 data = json.loads(response.read().decode('utf-8'))
-                for obs in data.get('observations', []):
-                    if obs.get('value', '.') != '.':
-                        return float(obs.get('value')), obs.get('date')
+                # 過濾出數值不是 '.' 的有效資料
+                valid_obs = [obs for obs in data.get('observations', []) if obs.get('value', '.') != '.']
+                
+                if len(valid_obs) >= 2:
+                    return float(valid_obs[0]['value']), float(valid_obs[1]['value']), valid_obs[0]['date']
+                elif len(valid_obs) == 1:
+                    return float(valid_obs[0]['value']), None, valid_obs[0]['date']
         except Exception:
             pass
-        return None, None
+        return None, None, None
 
     def analyze(self):
         # 擴充後的指標庫 (權重總和為 1.0)
@@ -41,19 +46,28 @@ class LiveFedPredictor:
         for name, sid, unit, weight, eval_fn in metrics:
             # 針對 JOLTS 求供比進行客製化計算 (職缺數 / 失業人數)
             if sid == "JOLTS_RATIO":
-                jol, d1 = self._get_latest_obs("JTSJOL", "lin")
-                unemp, d2 = self._get_latest_obs("UNEMPLOY", "lin")
-                if jol and unemp and unemp > 0:
-                    val = jol / unemp
+                jol_val1, jol_val2, d1 = self._get_latest_obs("JTSJOL", "lin")
+                unemp_val1, unemp_val2, d2 = self._get_latest_obs("UNEMPLOY", "lin")
+                if jol_val1 and unemp_val1 and unemp_val1 > 0:
+                    val = jol_val1 / unemp_val1
+                    prev_val = (jol_val2 / unemp_val2) if (jol_val2 and unemp_val2 and unemp_val2 > 0) else None
                     date = max(d1, d2)
                 else:
-                    val, date = None, None
+                    val, prev_val, date = None, None, None
             else:
-                val, date = self._get_latest_obs(sid, units=unit)
+                val, prev_val, date = self._get_latest_obs(sid, units=unit)
             
             if val is not None:
                 if date: dates.append(date)
                 signal = eval_fn(val)
+                
+                # 計算與前一期的變化
+                diff_str = ""
+                if prev_val is not None:
+                    diff = val - prev_val
+                    sign = "+" if diff > 0 else ""
+                    diff_str = f" ({sign}{diff:.2f})"
+
                 if signal == "Hike": 
                     hike_score += weight
                     sig_txt = "🔴 升息"
@@ -63,7 +77,9 @@ class LiveFedPredictor:
                 else: 
                     hold_score += weight
                     sig_txt = "🟡 持平"
-                results.append({"指標": name, "數值": f"{val:.2f}", "判定": sig_txt})
+                    
+                # 組合字串，例如 3.41 (+0.60)
+                results.append({"指標": name, "數值": f"{val:.2f}{diff_str}", "判定": sig_txt})
             else:
                 results.append({"指標": name, "數值": "N/A", "判定": "❓ 缺資料"})
 
@@ -84,33 +100,29 @@ class DailyMarketTracker:
         self.headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
 
     def fetch_yfinance_prices(self):
-        """抓取美股與大盤指數 (含漲跌幅計算)"""
+        """抓取美股、大盤指數與匯率 (含漲跌幅計算)"""
         tickers = {
             "台股大盤": "^TWII",
             "費半指數": "^SOX",
             "輝達 NVDA": "NVDA",
-            "台積電 ADR": "TSM"
+            "台積電 ADR": "TSM",
+            "美元兌台幣": "TWD=X"   # <-- 新增匯率報價
         }
         prices = {}
         for name, symbol in tickers.items():
             try:
                 stock = yf.Ticker(symbol)
-                # 抓取最近 5 天資料，確保能拿到前一個交易日的收盤價
                 hist = stock.history(period="5d")
                 
                 if len(hist) >= 2:
                     current_price = hist['Close'].iloc[-1]
                     prev_price = hist['Close'].iloc[-2]
                     
-                    # 計算漲跌幅 %
                     pct_change = ((current_price - prev_price) / prev_price) * 100
-                    
-                    # 格式化字串 (正數加上 + 號，負數自帶 - 號)
                     sign = "+" if pct_change > 0 else ""
                     prices[name] = f"{current_price:.2f} ({sign}{pct_change:.2f}%)"
                     
                 elif len(hist) == 1:
-                    # 萬一只有一天資料的防呆機制
                     current_price = hist['Close'].iloc[-1]
                     prices[name] = f"{current_price:.2f} (N/A)"
                 else:
@@ -138,66 +150,44 @@ class DailyMarketTracker:
             chips = {k: "N/A (遭阻擋)" for k in chips}
         return chips
 
-    def fetch_finmind_margin(self, token=""):
-        """改用 FinMind API 抓取大盤融資融券餘額與單日增減"""
-        # 往回抓 10 天確保跨過連假能拿到最新交易日資料
-        end_date = pd.Timestamp.today().strftime('%Y-%m-%d')
-        start_date = (pd.Timestamp.today() - pd.Timedelta(days=10)).strftime('%Y-%m-%d')
-        
-        url = "https://api.finmindtrade.com/api/v4/data"
-        parameter = {
-            "dataset": "TaiwanStockTotalMarginPurchaseShortSale",
-            "start_date": start_date,
-            "end_date": end_date,
-        }
-        
-        # 如果有傳入 Token，就把它加進參數裡
-        if token:
-            parameter["token"] = token
-            
+    def fetch_twse_margin(self):
+        """免費且穩定的官方管道：抓取證交所最新融資融券餘額"""
+        url = "https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json"
         margin_data = {
             "融資餘額(億)": "N/A", 
             "融券餘額(萬張)": "N/A", 
-            "融資維持率": "N/A (FinMind需付費)"
+            "融資維持率": "N/A (官方未直接提供)"
         }
-        
         try:
-            res = requests.get(url, params=parameter, timeout=10)
+            res = requests.get(url, headers=self.headers, timeout=5)
             data = res.json()
-            if data.get('msg') == 'success' and len(data.get('data', [])) > 0:
-                # 轉為 DataFrame 後抓取最後一筆 (最新交易日)
-                df = pd.DataFrame(data['data'])
-                df = df.sort_values("date")
-                latest = df.iloc[-1]
-                
-                # 處理融資餘額 (單位：仟元，需轉為億)
-                curr_margin = float(latest["MarginPurchaseTodayBalance"])
-                prev_margin = float(latest["MarginPurchaseYesterdayBalance"])
-                diff_margin = curr_margin - prev_margin
-                
-                # 防呆：若資料庫單位為元，動態調整分母
-                divisor_margin = 100000000 if curr_margin > 10000000000 else 100000 
-                curr_margin_yi = curr_margin / divisor_margin
-                diff_margin_yi = diff_margin / divisor_margin
-                sign_m = "+" if diff_margin_yi > 0 else ""
-                margin_data["融資餘額(億)"] = f"{curr_margin_yi:.2f} ({sign_m}{diff_margin_yi:.2f})"
-                
-                # 處理融券餘額 (單位：張，需轉為萬張)
-                curr_short = float(latest["ShortSaleTodayBalance"])
-                prev_short = float(latest["ShortSaleYesterdayBalance"])
-                diff_short = curr_short - prev_short
-                
-                curr_short_wan = curr_short / 10000
-                diff_short_wan = diff_short / 10000
-                sign_s = "+" if diff_short_wan > 0 else ""
-                margin_data["融券餘額(萬張)"] = f"{curr_short_wan:.2f} ({sign_s}{diff_short_wan:.2f})"
-                
-        except Exception as e:
-            # 發生例外時，字典中預設的 'N/A' 會傳遞給使用者
+            if data.get('stat') == 'OK':
+                # 證交所 API 的 data1 包含了「信用交易統計」
+                # 欄位依序：[0]項目名稱, [1]買進, [2]賣出, [3]現金(券)償還, [4]前日餘額, [5]今日餘額
+                for row in data.get('data1', []):
+                    item_name = row[0]
+                    if "融資金額(仟元)" in item_name:
+                        prev_bal = float(row[4].replace(',', ''))
+                        curr_bal = float(row[5].replace(',', ''))
+                        
+                        # 將 仟元 轉為 億 (除以 100,000)
+                        curr_yi = curr_bal / 100000
+                        diff_yi = (curr_bal - prev_bal) / 100000
+                        sign = "+" if diff_yi > 0 else ""
+                        margin_data["融資餘額(億)"] = f"{curr_yi:.2f} ({sign}{diff_yi:.2f})"
+                        
+                    elif "融券(交易單位)" in item_name:
+                        prev_bal = float(row[4].replace(',', ''))
+                        curr_bal = float(row[5].replace(',', ''))
+                        
+                        # 將 張 轉為 萬張 (除以 10,000)
+                        curr_wan = curr_bal / 10000
+                        diff_wan = (curr_bal - prev_bal) / 10000
+                        sign = "+" if diff_wan > 0 else ""
+                        margin_data["融券餘額(萬張)"] = f"{curr_wan:.2f} ({sign}{diff_wan:.2f})"
+        except Exception:
             pass
-            
         return margin_data
-
 
 def send_line_message(token, user_id, text):
     url = 'https://api.line.me/v2/bot/message/push'
@@ -206,28 +196,26 @@ def send_line_message(token, user_id, text):
     req = urllib.request.Request(url, data=json.dumps(data).encode('utf-8'), headers=headers, method='POST')
     urllib.request.urlopen(req)
 
-
 if __name__ == "__main__":
     FRED_API_KEY = os.environ.get("FRED_API_KEY")
     LINE_ACCESS_TOKEN = os.environ.get("LINE_ACCESS_TOKEN")
     LINE_USER_ID = os.environ.get("LINE_USER_ID")
-    FINMIND_TOKEN = os.environ.get("FINMIND_TOKEN", "")  # 讀取 GitHub Secret 中的 FinMind Token
 
     if not all([FRED_API_KEY, LINE_ACCESS_TOKEN, LINE_USER_ID]):
-        print("❌ 錯誤：找不到環境變數 (FRED_API_KEY, LINE_ACCESS_TOKEN, LINE_USER_ID)")
+        print("❌ 錯誤：找不到環境變數")
         exit(1)
 
-    # 1. 抓取美聯儲數據 (包含最新更新日期)
+    # 1. 抓取美聯儲數據
     fed_bot = LiveFedPredictor(api_key=FRED_API_KEY)
     fed_results, prob, latest_date = fed_bot.analyze()
 
     # 2. 抓取市場價格與籌碼數據
     market_bot = DailyMarketTracker()
     prices = market_bot.fetch_yfinance_prices()
-    chips = market_bot.fetch_twse_institutional()
     
-    # 2.5 呼叫 FinMind 取得大盤融資融券並更新進字典，傳入 token 提升穩定度與權限
-    margin_data = market_bot.fetch_finmind_margin(token=FINMIND_TOKEN)
+    # 2.5 抓取證交所三大法人與融資融券 (免費官方管道)
+    chips = market_bot.fetch_twse_institutional()
+    margin_data = market_bot.fetch_twse_margin()
     chips.update(margin_data)
 
     # 3. 組合 LINE 訊息 
@@ -247,14 +235,19 @@ if __name__ == "__main__":
     
     msg += "\n💰 【台股現貨與信用籌碼】\n"
     for name, net_buy in chips.items():
-        # 若是外資等買超單位為 float / int 就給紅綠燈，字串(N/A或無資料)就給白燈
+        # 自動給予紅綠白燈：若是數字根據正負給燈，若是字串(如融資)根據括弧內的正負號給燈
         if isinstance(net_buy, (int, float)):
             icon = "🔴" if net_buy > 0 else ("🟢" if net_buy < 0 else "⚪")
+        elif isinstance(net_buy, str) and "(+" in net_buy:
+            icon = "🔴"
+        elif isinstance(net_buy, str) and "(-" in net_buy:
+            icon = "🟢"
         else:
             icon = "⚪"
+            
         msg += f"• {name}: {icon} {net_buy}\n"
         
-    msg += "\n(註: 大盤融資維持率 FinMind 需付費權限；期貨未平倉因資安限制暫以現貨為主。)"
+    msg += "\n(註: 期貨未平倉因資安限制暫以現貨為主；融資維持率官方不直接公佈。)"
 
     # 送出 LINE 訊息
     send_line_message(LINE_ACCESS_TOKEN, LINE_USER_ID, msg)
