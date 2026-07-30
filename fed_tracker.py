@@ -8,9 +8,11 @@ import time
 import urllib.parse
 import datetime
 import io
+import urllib3
 
-# 關閉 pandas 警告
+# 關閉 pandas 警告與 SSL 警告
 pd.options.mode.chained_assignment = None
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class LiveFedPredictor:
     """主題一：聯準會利率決策預測模組 (串接 FRED API)"""
@@ -189,18 +191,28 @@ class DailyMarketTracker:
 
 
 class TaiwanDerivativesTrackerTaifex:
-    """主題三 (方案B)：台指期權進階籌碼 (直接串接期交所 API - 終極穩定版)"""
+    """主題三：台指期權進階籌碼 (三層防禦終極穩定版)"""
     def __init__(self):
-        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://www.taifex.com.tw/cht/3/pcRatio",
+            "Origin": "https://www.taifex.com.tw"
+        }
 
     def get_taifex_csv(self, url, payload):
         try:
-            res = requests.post(url, data=payload, headers=self.headers, timeout=10)
+            # 1. 嘗試 POST 請求
+            res = requests.post(url, data=payload, headers=self.headers, timeout=10, verify=False)
+            if res.status_code != 200 or not res.text.strip() or "<html" in res.text.lower():
+                # 2. 嘗試 GET 備援
+                query_str = urllib.parse.urlencode(payload)
+                res = requests.get(f"{url}?{query_str}", headers=self.headers, timeout=10, verify=False)
+
             if res.status_code != 200: return pd.DataFrame()
             res.encoding = 'big5'
             csv_text = res.text
             
-            if not csv_text.strip(): return pd.DataFrame()
+            if not csv_text.strip() or "<html" in csv_text.lower(): return pd.DataFrame()
             
             df = pd.read_csv(io.StringIO(csv_text), on_bad_lines='skip')
             df.columns = df.columns.str.strip().str.replace(' ', '')
@@ -211,17 +223,45 @@ class TaiwanDerivativesTrackerTaifex:
             
             if '日期' not in df.columns: return pd.DataFrame()
             
-            # 【修復重點】：加入 .astype(str) 防止 YYYYMMDD 被誤判為 1970 奈秒時間戳
-            df['日期'] = pd.to_datetime(df['日期'].astype(str), errors='coerce')
+            # 日期安全解析 (相容 YYYYMMDD / YYYY/MM/DD / YYYY-MM-DD)
+            raw_dates = df['日期'].astype(str).str.replace('-', '').str.replace('/', '').str.strip()
+            df['日期'] = pd.to_datetime(raw_dates, format='%Y%m%d', errors='coerce')
             df = df.dropna(subset=['日期'])
             df['日期'] = df['日期'].dt.strftime('%Y/%m/%d')
             
             for col in df.columns:
                 if df[col].dtype == 'object': 
-                    df[col] = df[col].str.strip()
+                    df[col] = df[col].astype(str).str.strip()
             return df
         except:
             return pd.DataFrame()
+
+    def fetch_pcr_fallback(self):
+        """三層防禦：若官網 CSV 下載完全失敗，自動呼叫期交所官方開放 API (OpenAPI)"""
+        try:
+            url = "https://openapi.taifex.com.tw/v1/Daily_PCRatio"
+            res = requests.get(url, headers=self.headers, timeout=10, verify=False)
+            if res.status_code == 200:
+                data = res.json()
+                df = pd.DataFrame(data)
+                if df.empty: return pd.DataFrame()
+                
+                # 欄位自動適應映射
+                col_map = {}
+                for c in df.columns:
+                    if c.lower() in ['date', '日期']: col_map[c] = '日期'
+                    elif 'ratio' in c.lower() or '比率' in c: col_map[c] = '買賣權未平倉量比率%'
+                
+                df.rename(columns=col_map, inplace=True)
+                if '日期' in df.columns:
+                    raw_dates = df['日期'].astype(str).str.replace('-', '').str.replace('/', '').str.strip()
+                    df['日期'] = pd.to_datetime(raw_dates, format='%Y%m%d', errors='coerce')
+                    df = df.dropna(subset=['日期'])
+                    df['日期'] = df['日期'].dt.strftime('%Y/%m/%d')
+                    return df
+        except:
+            pass
+        return pd.DataFrame()
 
     def fetch_data(self):
         end_date = datetime.datetime.now()
@@ -229,39 +269,28 @@ class TaiwanDerivativesTrackerTaifex:
         d_start = start_date.strftime("%Y/%m/%d")
         d_end = end_date.strftime("%Y/%m/%d")
 
-        def pl_pcr(): 
-            return {"queryStartDate": d_start, "queryEndDate": d_end}
-            
-        def pl_inst(cid): 
-            return {"queryStartDate": d_start, "queryEndDate": d_end, "commodityId": cid}
-            
-        def pl_daily(cid): 
-            return {"queryStartDate": d_start, "queryEndDate": d_end, "commodity_id": cid, "down_type": "1"}
+        def pl_pcr(): return {"queryStartDate": d_start, "queryEndDate": d_end}
+        def pl_inst(cid): return {"queryStartDate": d_start, "queryEndDate": d_end, "commodityId": cid}
+        def pl_daily(cid): return {"queryStartDate": d_start, "queryEndDate": d_end, "commodity_id": cid, "down_type": "1"}
 
-        # 1. 抓取 PCR
+        # 1. 抓取 PCR (先嘗試官網 CSV，失敗則切換至官方 OpenAPI)
         df_pcr = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/pcRatioDown", pl_pcr())
         if df_pcr.empty or '日期' not in df_pcr.columns:
-            return "\n⚠️ 無法取得期交所籌碼數據(PCR)，請檢查網路或稍後再試\n"
-        
-        dates = sorted(df_pcr['日期'].unique(), reverse=True)
-        if len(dates) == 0: 
-            return "\n⚠️ 期交所目前無有效日期資料，請稍後再試\n"
-        d1 = dates[0]
-        d2 = dates[1] if len(dates) > 1 else d1 
+            df_pcr = self.fetch_pcr_fallback()
 
-        # 2. 抓取外資選擇權與期貨資料 (法人區)
+        # 2. 抓取外資選擇權與期貨數據
         df_opt = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/callsAndPutsDateDown", pl_inst("TXO"))
         df_mtx_inst = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futContractsDateDown", pl_inst("MTX"))
         df_tmf_inst = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futContractsDateDown", pl_inst("TMF"))
         
-        # 3. 抓取全市場期貨總未平倉量 (每日市場區)
+        # 3. 抓取全市場期貨總未平倉量
         df_mtx_daily = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futDataDown", pl_daily("MTX"))
         df_tmf_daily = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futDataDown", pl_daily("TMF"))
 
         # 4. 抓取 VIX 指數
         df_vix = pd.DataFrame()
         try:
-            res_vix = requests.post("https://www.taifex.com.tw/cht/7/vixData", data=pl_pcr(), headers=self.headers, timeout=10)
+            res_vix = requests.post("https://www.taifex.com.tw/cht/7/vixData", data=pl_pcr(), headers=self.headers, timeout=10, verify=False)
             res_vix.encoding = 'utf-8'
             dfs = pd.read_html(io.StringIO(res_vix.text))
             for d in dfs:
@@ -272,8 +301,8 @@ class TaiwanDerivativesTrackerTaifex:
                         break
                         
                 if '日期' in d.columns and '收盤指數' in d.columns:
-                    # 【修復重點】：同步加入 .astype(str) 防呆
-                    d['日期'] = pd.to_datetime(d['日期'].astype(str), errors='coerce')
+                    raw_dates = d['日期'].astype(str).str.replace('-', '').str.replace('/', '').str.strip()
+                    d['日期'] = pd.to_datetime(raw_dates, format='%Y%m%d', errors='coerce')
                     d = d.dropna(subset=['日期'])
                     d['日期'] = d['日期'].dt.strftime('%Y/%m/%d')
                     df_vix = d
@@ -281,7 +310,20 @@ class TaiwanDerivativesTrackerTaifex:
         except:
             pass
 
-        # ===== 安全型別轉換 (加入防禦期交所的 '-' 橫槓符號) =====
+        # 動態尋找最新交易日期 (確保哪怕某一介面失效也不會崩潰)
+        dates = []
+        for df in [df_pcr, df_opt, df_mtx_inst]:
+            if not df.empty and '日期' in df.columns:
+                dates = sorted(df['日期'].unique(), reverse=True)
+                if len(dates) > 0: break
+
+        if len(dates) == 0:
+            return "\n⚠️ 期交所目前伺服器連線異常，請稍後再試\n"
+
+        d1 = dates[0]
+        d2 = dates[1] if len(dates) > 1 else d1 
+
+        # ===== 安全數值轉換處理 =====
         def s_int(val): 
             try:
                 v = str(val).replace(',', '').strip()
@@ -296,7 +338,7 @@ class TaiwanDerivativesTrackerTaifex:
             except:
                 return 0.0
 
-        # ===== 資料提取與計算邏輯 =====
+        # ===== 資料提取與計算 =====
         def get_pcr(d_str):
             if df_pcr.empty: return 0.0
             sub = df_pcr[df_pcr['日期'] == d_str]
@@ -326,20 +368,16 @@ class TaiwanDerivativesTrackerTaifex:
         def get_ret_net(df, d_str):
             if df.empty: return 0
             sub = df[df['日期'] == d_str] 
-            
             net_col = next((c for c in df.columns if '未平倉淨' in c), None)
             if not net_col: net_col = next((c for c in df.columns if '淨額' in c), None)
             if not net_col: return 0
-            
             return -sum([s_int(x) for x in sub[net_col].values]) if not sub.empty else 0
 
         def get_tot(df, d_str):
             if df.empty: return 1
             sub = df[df['日期'] == d_str] 
-            
             if '交易時段' in sub.columns: 
                 sub = sub[sub['交易時段'].astype(str).str.contains('一般', na=False)] 
-            
             oi_col = next((c for c in df.columns if '未沖銷' in c or '未平倉' in c), None)
             if not sub.empty and oi_col: 
                 return sum([s_int(x) for x in sub[oi_col].values])
@@ -362,7 +400,7 @@ class TaiwanDerivativesTrackerTaifex:
         rr_t_1 = (rt_1 / tt_1) * 100 if tt_1 > 1 else 0.0
         rr_t_2 = (rt_2 / tt_2) * 100 if tt_2 > 1 else 0.0
 
-        # ===== 排版輸出 =====
+        # ===== 格式化訊息 =====
         def s_str(v): return f"+{v}" if v > 0 else str(v)
         def s_fstr(v): return f"+{v:.2f}" if v > 0 else f"{v:.2f}"
         def ar(c, p): return "↗" if c > p else ("↘" if c < p else "→")
@@ -383,7 +421,11 @@ class TaiwanDerivativesTrackerTaifex:
 class TaiwanOptionsTracker:
     """主題四：台指選擇權莊家籌碼與痛點計算"""
     def __init__(self):
-        self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        self.headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://www.taifex.com.tw/cht/3/optDataDown",
+            "Origin": "https://www.taifex.com.tw"
+        }
 
     def get_twse_close(self, date_str):
         twse_date = date_str.replace('/', '') 
@@ -414,11 +456,11 @@ class TaiwanOptionsTracker:
             "queryStartDate": date_str, "queryEndDate": date_str, "macrostype": "siron"
         }
         try:
-            response = requests.post(url, data=payload, headers=self.headers, timeout=10)
+            response = requests.post(url, data=payload, headers=self.headers, timeout=10, verify=False)
             if response.status_code != 200: return pd.DataFrame()
             response.encoding = 'big5'
             csv_text = response.text
-            if len(csv_text) < 500 or "交易日期" not in csv_text: return pd.DataFrame()
+            if len(csv_text) < 500 or ("交易日期" not in csv_text and "日期" not in csv_text): return pd.DataFrame()
             return pd.read_csv(io.StringIO(csv_text))
         except:
             return pd.DataFrame()
@@ -514,7 +556,6 @@ class TaiwanOptionsTracker:
             p1 = int(sorted_pain.iloc[0]['Strike_Price'])
             p1_str = self.format_payout(sorted_pain.iloc[0]['Total_Pain'])
             
-            # 近大盤痛點
             if taiex_close > 0:
                 near_zone_df = pain_df[abs(pain_df['Strike_Price'] - taiex_close) <= 600]
                 if not near_zone_df.empty:
