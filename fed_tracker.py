@@ -204,13 +204,15 @@ class TaiwanDerivativesTrackerTaifex:
             df = pd.read_csv(io.StringIO(csv_text), on_bad_lines='skip')
             df.columns = df.columns.str.strip().str.replace(' ', '')
             
-            # 【關鍵修復】: 強制將不同名稱的日期欄位統一轉換為 '日期'
-            for date_col in ['交易日期', 'Date']:
-                if date_col in df.columns:
+            # 【關鍵修復 1】: 統一日期欄位名稱
+            for date_col in ['交易日期', 'Date', '日期']:
+                if date_col in df.columns and date_col != '日期':
                     df.rename(columns={date_col: '日期'}, inplace=True)
             
-            # 檢查是否有最終標準化的 '日期' 欄位
             if '日期' not in df.columns: return pd.DataFrame()
+            
+            # 【關鍵修復 2】: 嚴格過濾垃圾列 (Footer)，只保留 YYYY/MM/DD 格式的有效資料
+            df = df[df['日期'].astype(str).str.match(r'^\d{4}/\d{2}/\d{2}$', na=False)]
             
             for col in df.columns:
                 if df[col].dtype == 'object': 
@@ -225,7 +227,6 @@ class TaiwanDerivativesTrackerTaifex:
         d_start = start_date.strftime("%Y/%m/%d")
         d_end = end_date.strftime("%Y/%m/%d")
 
-        # 輔助產生 Payload 參數
         def pl(cid): 
             return {"queryStartDate": d_start, "queryEndDate": d_end, 
                     "commodityId": cid, "commodity_id": cid, "down_type": "1"}
@@ -248,7 +249,7 @@ class TaiwanDerivativesTrackerTaifex:
         df_mtx_daily = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futDataDown", pl("MTX"))
         df_tmf_daily = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futDataDown", pl("TMF"))
 
-        # 4. 抓取 VIX 指數 (從網頁表格提取)
+        # 4. 抓取 VIX 指數
         df_vix = pd.DataFrame()
         try:
             res_vix = requests.post("https://www.taifex.com.tw/cht/7/vixData", data=pl(""), headers=self.headers, timeout=10)
@@ -256,13 +257,14 @@ class TaiwanDerivativesTrackerTaifex:
             dfs = pd.read_html(io.StringIO(res_vix.text))
             for d in dfs:
                 d.columns = d.columns.str.strip().str.replace(' ', '')
-                # 同樣對 VIX 表格進行日期標準化
                 for date_col_name in ['交易日期', 'Date']:
                     if date_col_name in d.columns:
                         d.rename(columns={date_col_name: '日期'}, inplace=True)
                         break
                         
                 if '日期' in d.columns and '收盤指數' in d.columns:
+                    # 【關鍵修復 3】: 同樣過濾 VIX 的垃圾日期
+                    d = d[d['日期'].astype(str).str.match(r'^\d{4}/\d{2}/\d{2}$', na=False)]
                     df_vix = d
                     break
         except:
@@ -275,8 +277,9 @@ class TaiwanDerivativesTrackerTaifex:
         # ===== 資料提取與計算邏輯 =====
         def get_pcr(d_str):
             sub = df_pcr[df_pcr['日期'] == d_str]
-            # 動態找尋 pcr 欄位
-            pcr_col = next((c for c in df_pcr.columns if '比率' in c or 'Ratio' in c), None)
+            # 【關鍵修復 4】: 優先抓「未平倉量比率」，避免誤抓成「成交量比率」
+            pcr_col = next((c for c in df_pcr.columns if '未平倉' in c and ('比率' in c or 'Ratio' in c)), None)
+            if not pcr_col: pcr_col = next((c for c in df_pcr.columns if '比率' in c or 'Ratio' in c), None)
             return s_flt(sub[pcr_col].values[0]) if not sub.empty and pcr_col else 0.0
 
         def get_vix(d_str):
@@ -286,38 +289,37 @@ class TaiwanDerivativesTrackerTaifex:
 
         def get_opt_foreign(d_str, cp):
             if df_opt.empty: return 0
-            # 動態找出包含「買賣權」的欄位名稱
             cp_col = next((col for col in df_opt.columns if '買賣權' in col), None)
             if not cp_col: return 0
             
-            # 【修復重點】：加入 .astype(str) 防呆轉換
             sub = df_opt[(df_opt['日期'] == d_str) & 
                          (df_opt['身份別'].astype(str).str.contains('外資', na=False)) & 
                          (df_opt[cp_col].astype(str).str.contains(cp, na=False))]
                          
-            net_col = next((c for c in df_opt.columns if '淨額' in c), None)
+            # 【關鍵修復 5】: 優先抓「未平倉淨額」，避免誤抓成「多空淨額(當沖量)」
+            net_col = next((c for c in df_opt.columns if '未平倉淨' in c), None)
+            if not net_col: net_col = next((c for c in df_opt.columns if '淨額' in c), None)
+            
             return s_int(sub[net_col].values[0]) if not sub.empty and net_col else 0
 
         def get_ret_net(df, d_str):
             if df.empty: return 0
-            sub = df[df['日期'] == d_str] # 現在保證有 '日期' 欄位
+            sub = df[df['日期'] == d_str] 
             
-            # 動態搜尋淨額欄位 (多空淨額口數 or 未平倉淨額口數)
-            net_col = next((c for c in df.columns if '淨額' in c), None)
+            # 【關鍵修復 6】: 同樣優先抓「未平倉淨額」
+            net_col = next((c for c in df.columns if '未平倉淨' in c), None)
+            if not net_col: net_col = next((c for c in df.columns if '淨額' in c), None)
             if not net_col: return 0
             
-            # 散戶淨額 = - (三大法人淨額總和)
             return -sum([s_int(x) for x in sub[net_col].values]) if not sub.empty else 0
 
         def get_tot(df, d_str):
             if df.empty: return 1
-            sub = df[df['日期'] == d_str] # 現在保證有 '日期' 欄位
+            sub = df[df['日期'] == d_str] 
             
-            # 【修復重點】：加入 .astype(str) 防呆轉換
             if '交易時段' in sub.columns: 
-                sub = sub[sub['交易時段'].astype(str).str.contains('一般', na=False)] # 排除夜盤
+                sub = sub[sub['交易時段'].astype(str).str.contains('一般', na=False)] 
             
-            # 動態搜尋未平倉欄位 (未沖銷契約量 or 未平倉量)
             oi_col = next((c for c in df.columns if '未沖銷' in c or '未平倉' in c), None)
             if not sub.empty and oi_col: 
                 return sum([s_int(x) for x in sub[oi_col].values])
