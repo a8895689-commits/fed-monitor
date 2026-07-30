@@ -189,7 +189,7 @@ class DailyMarketTracker:
 
 
 class TaiwanDerivativesTrackerTaifex:
-    """主題三 (方案B)：台指期權進階籌碼 (直接串接期交所 API - 強化容錯版)"""
+    """主題三 (方案B)：台指期權進階籌碼 (直接串接期交所 API - 終極穩定版)"""
     def __init__(self):
         self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
@@ -200,21 +200,20 @@ class TaiwanDerivativesTrackerTaifex:
             res.encoding = 'big5'
             csv_text = res.text
             
-            # 讀取 CSV 並略過結尾可能出現的備註干擾
+            # 若無內容直接返回
+            if not csv_text.strip(): return pd.DataFrame()
+            
             df = pd.read_csv(io.StringIO(csv_text), on_bad_lines='skip')
             df.columns = df.columns.str.strip().str.replace(' ', '')
             
-            # 【關鍵修復 1】: 統一日期欄位名稱
             for date_col in ['交易日期', 'Date', '日期']:
                 if date_col in df.columns and date_col != '日期':
                     df.rename(columns={date_col: '日期'}, inplace=True)
             
             if '日期' not in df.columns: return pd.DataFrame()
             
-            # 【關鍵修復 2】: 使用 pd.to_datetime 自動過濾垃圾資料 (將備註文字轉為 NaT 並剔除)
             df['日期'] = pd.to_datetime(df['日期'], errors='coerce')
             df = df.dropna(subset=['日期'])
-            # 統一標準化為 YYYY/MM/DD 格式，這樣不管是 7/30 還是 07/30 都不會比對失敗
             df['日期'] = df['日期'].dt.strftime('%Y/%m/%d')
             
             for col in df.columns:
@@ -230,32 +229,41 @@ class TaiwanDerivativesTrackerTaifex:
         d_start = start_date.strftime("%Y/%m/%d")
         d_end = end_date.strftime("%Y/%m/%d")
 
-        def pl(cid): 
-            return {"queryStartDate": d_start, "queryEndDate": d_end, 
-                    "commodityId": cid, "commodity_id": cid, "down_type": "1"}
+        # 【關鍵修復 1】: 針對不同 API 準備專屬的參數，避免期交所伺服器拒絕日期區間
+        def pl_pcr(): 
+            return {"queryStartDate": d_start, "queryEndDate": d_end}
+            
+        def pl_inst(cid): 
+            return {"queryStartDate": d_start, "queryEndDate": d_end, "commodityId": cid}
+            
+        def pl_daily(cid): 
+            return {"queryStartDate": d_start, "queryEndDate": d_end, "commodity_id": cid, "down_type": "1"}
 
         # 1. 抓取 PCR
-        df_pcr = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/pcRatioDown", pl(""))
+        df_pcr = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/pcRatioDown", pl_pcr())
         if df_pcr.empty or '日期' not in df_pcr.columns:
             return "\n⚠️ 無法取得期交所籌碼數據(PCR)，請檢查網路或稍後再試\n"
         
         dates = sorted(df_pcr['日期'].unique(), reverse=True)
-        if len(dates) < 2: return "\n⚠️ 期交所籌碼歷史天數不足\n"
-        d1, d2 = dates[0], dates[1]
+        # 【關鍵修復 2】: 柔性容錯。如果真的只抓到 1 天，就不報錯，直接當作昨天的數據與今天相同
+        if len(dates) == 0: 
+            return "\n⚠️ 期交所目前無有效日期資料，請稍後再試\n"
+        d1 = dates[0]
+        d2 = dates[1] if len(dates) > 1 else d1 
 
-        # 2. 抓取外資選擇權與期貨資料
-        df_opt = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/callsAndPutsDateDown", pl("TXO"))
-        df_mtx_inst = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futContractsDateDown", pl("MTX"))
-        df_tmf_inst = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futContractsDateDown", pl("TMF"))
+        # 2. 抓取外資選擇權與期貨資料 (法人區)
+        df_opt = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/callsAndPutsDateDown", pl_inst("TXO"))
+        df_mtx_inst = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futContractsDateDown", pl_inst("MTX"))
+        df_tmf_inst = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futContractsDateDown", pl_inst("TMF"))
         
-        # 3. 抓取全市場期貨總未平倉量
-        df_mtx_daily = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futDataDown", pl("MTX"))
-        df_tmf_daily = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futDataDown", pl("TMF"))
+        # 3. 抓取全市場期貨總未平倉量 (每日市場區)
+        df_mtx_daily = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futDataDown", pl_daily("MTX"))
+        df_tmf_daily = self.get_taifex_csv("https://www.taifex.com.tw/cht/3/futDataDown", pl_daily("TMF"))
 
         # 4. 抓取 VIX 指數
         df_vix = pd.DataFrame()
         try:
-            res_vix = requests.post("https://www.taifex.com.tw/cht/7/vixData", data=pl(""), headers=self.headers, timeout=10)
+            res_vix = requests.post("https://www.taifex.com.tw/cht/7/vixData", data=pl_pcr(), headers=self.headers, timeout=10)
             res_vix.encoding = 'utf-8'
             dfs = pd.read_html(io.StringIO(res_vix.text))
             for d in dfs:
@@ -266,11 +274,9 @@ class TaiwanDerivativesTrackerTaifex:
                         break
                         
                 if '日期' in d.columns and '收盤指數' in d.columns:
-                    # 【關鍵修復 3】: VIX 表格同樣使用 pd.to_datetime 過濾垃圾資訊
                     d['日期'] = pd.to_datetime(d['日期'], errors='coerce')
                     d = d.dropna(subset=['日期'])
                     d['日期'] = d['日期'].dt.strftime('%Y/%m/%d')
-                    
                     df_vix = d
                     break
         except:
@@ -284,7 +290,6 @@ class TaiwanDerivativesTrackerTaifex:
         def get_pcr(d_str):
             if df_pcr.empty: return 0.0
             sub = df_pcr[df_pcr['日期'] == d_str]
-            # 優先抓未平倉量比率
             pcr_col = next((c for c in df_pcr.columns if '未平倉' in c and ('比率' in c or 'Ratio' in c)), None)
             if not pcr_col: pcr_col = next((c for c in df_pcr.columns if '比率' in c or 'Ratio' in c), None)
             return s_flt(sub[pcr_col].values[0]) if not sub.empty and pcr_col else 0.0
@@ -342,7 +347,6 @@ class TaiwanDerivativesTrackerTaifex:
         tm_1, tm_2 = get_tot(df_mtx_daily, d1), get_tot(df_mtx_daily, d2)
         tt_1, tt_2 = get_tot(df_tmf_daily, d1), get_tot(df_tmf_daily, d2)
 
-        # 散戶多空比 = 散戶淨未平倉 / 總未平倉
         rr_m_1 = (rm_1 / tm_1) * 100 if tm_1 > 1 else 0.0
         rr_m_2 = (rm_2 / tm_2) * 100 if tm_2 > 1 else 0.0
         rr_t_1 = (rt_1 / tt_1) * 100 if tt_1 > 1 else 0.0
