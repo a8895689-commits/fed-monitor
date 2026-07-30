@@ -120,9 +120,9 @@ class DailyMarketTracker:
             "費半指數": "^SOX",
             "輝達 NVDA": "NVDA",
             "台積電 ADR": "TSM",
-            "WTI 原油": "CL=F",            # 新增：西德州原油期貨
-            "10年美債(價格)": "ZN=F",      # 新增：10年期公債期貨價格
-            "2年美債(價格)": "TU=F",       # 新增：2年期公債期貨價格
+            "WTI 原油": "CL=F",            # 西德州原油期貨
+            "10年美債(價格)": "ZN=F",      # 10年期公債期貨價格
+            "2年美債(價格)": "ZT=F",       # 修復：改用 ZT=F (2年期公債期貨價格)
             "美元兌台幣": "TWD=X"
         }
         prices = {}
@@ -191,40 +191,6 @@ class DailyMarketTracker:
             pass
         return chips
 
-    def fetch_margin_balance(self):
-        """改用台灣證交所官方 API 抓取大盤總融資融券"""
-        chips = {"融資餘額(億)": "N/A", "融券餘額(萬張)": "N/A"}
-        timestamp = int(time.time())
-        # 使用證交所官方的「信用交易統計」API，不帶日期會自動回傳最新可用的交易日
-        url = f"https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&selectType=MS&_={timestamp}"
-        
-        data = self._safe_get_json(url)
-        try:
-            if data and data.get('stat') == 'OK':
-                # 在回傳的資料中尋找含有關鍵字的陣列
-                margin_row = next((row for row in data['data'] if "融資金額" in row[0]), None)
-                short_row = next((row for row in data['data'] if "融券" in row[0] and "金額" not in row[0]), None)
-                
-                if margin_row:
-                    # 證交所原始單位為「仟元」，除以 10萬 轉換為「億元」
-                    today_margin = int(margin_row[5].replace(',', '')) / 100000
-                    prev_margin = int(margin_row[4].replace(',', '')) / 100000
-                    diff_margin = today_margin - prev_margin
-                    sign_m = "+" if diff_margin > 0 else ""
-                    chips["融資餘額(億)"] = f"{today_margin:.2f} ({sign_m}{diff_margin:.2f})"
-                    
-                if short_row:
-                    # 證交所原始單位為「張」，除以 1萬 轉換為「萬張」
-                    today_short = int(short_row[5].replace(',', '')) / 10000
-                    prev_short = int(short_row[4].replace(',', '')) / 10000
-                    diff_short = today_short - prev_short
-                    sign_s = "+" if diff_short > 0 else ""
-                    chips["融券餘額(萬張)"] = f"{today_short:.2f} ({sign_s}{diff_short:.2f})"
-        except Exception as e:
-            pass
-            
-        return chips
-
 
 def send_line_message(token, user_id, text):
     url = 'https://api.line.me/v2/bot/message/push'
@@ -254,10 +220,8 @@ if __name__ == "__main__":
     treasury_yields = market_bot.fetch_treasury_yields()
     prices.update(treasury_yields)
     
-    # 2.2 抓取三大法人與融資融券
+    # 2.2 抓取三大法人籌碼
     chips = market_bot.fetch_twse_institutional()
-    margin_data = market_bot.fetch_margin_balance()
-    chips.update(margin_data)
 
     # 3. 組合 LINE 訊息 
     msg = "📊 【聯準會決策儀表板】\n"
@@ -274,14 +238,10 @@ if __name__ == "__main__":
     for name, price in prices.items():
         msg += f"• {name}: {price}\n"
     
-    msg += "\n💰 【台股現貨與信用籌碼】\n"
+    msg += "\n💰 【台股三大法人籌碼】\n"
     for name, net_buy in chips.items():
         if isinstance(net_buy, (int, float)):
             icon = "🔴" if net_buy > 0 else ("🟢" if net_buy < 0 else "⚪")
-        elif isinstance(net_buy, str) and "(+" in net_buy:
-            icon = "🔴"
-        elif isinstance(net_buy, str) and "(-" in net_buy:
-            icon = "🟢"
         else:
             icon = "⚪"
             
