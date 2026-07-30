@@ -138,6 +138,42 @@ class DailyMarketTracker:
             chips = {k: "N/A (遭阻擋)" for k in chips}
         return chips
 
+    def fetch_twse_margin(self):
+        """新增：抓取台灣證交所融資融券餘額與單日增減"""
+        url = "https://www.twse.com.tw/exchangeReport/MI_MARGN?response=json&selectType=MS"
+        margin_data = {
+            "融資餘額(億)": "N/A", 
+            "融券餘額(萬張)": "N/A", 
+            "融資維持率": "N/A(官方無提供)"
+        }
+        try:
+            res = requests.get(url, headers=self.headers, timeout=5)
+            data = res.json()
+            if data.get('stat') == 'OK':
+                for row in data.get('data', []):
+                    # 抓取融資金額 (單位: 仟元 -> 轉換為 億)
+                    if row[0] == '融資金額(仟元)':
+                        prev_bal = int(row[4].replace(',', ''))
+                        curr_bal = int(row[5].replace(',', ''))
+                        diff = (curr_bal - prev_bal) / 100000
+                        curr_bal_yi = curr_bal / 100000
+                        sign = "+" if diff > 0 else ""
+                        # 回傳格式: 今日餘額 (增減)
+                        margin_data["融資餘額(億)"] = f"{curr_bal_yi:.2f} ({sign}{diff:.2f})"
+                        
+                    # 抓取融券張數 (單位: 張 -> 轉換為 萬張)
+                    elif row[0] == '融券(交易單位)':
+                        prev_bal = int(row[4].replace(',', ''))
+                        curr_bal = int(row[5].replace(',', ''))
+                        diff = (curr_bal - prev_bal) / 10000
+                        curr_bal_wan = curr_bal / 10000
+                        sign = "+" if diff > 0 else ""
+                        margin_data["融券餘額(萬張)"] = f"{curr_bal_wan:.2f} ({sign}{diff:.2f})"
+        except Exception:
+            pass
+        return margin_data
+
+
 def send_line_message(token, user_id, text):
     url = 'https://api.line.me/v2/bot/message/push'
     headers = {'Content-Type': 'application/json', 'Authorization': f'Bearer {token}'}
@@ -162,6 +198,10 @@ if __name__ == "__main__":
     market_bot = DailyMarketTracker()
     prices = market_bot.fetch_yfinance_prices()
     chips = market_bot.fetch_twse_institutional()
+    
+    # 2.5 新增：抓取融資融券數據並合併進籌碼字典中
+    margin_data = market_bot.fetch_twse_margin()
+    chips.update(margin_data)
 
     # 3. 組合 LINE 訊息 
     msg = "📊 【聯準會決策儀表板】\n"
@@ -178,12 +218,13 @@ if __name__ == "__main__":
     for name, price in prices.items():
         msg += f"• {name}: {price}\n"
     
-    msg += "\n💰 【台股現貨籌碼 (單位:億)】\n"
+    msg += "\n💰 【台股現貨與信用籌碼】\n"
     for name, net_buy in chips.items():
         icon = "🔴" if isinstance(net_buy, (int, float)) and net_buy > 0 else ("🟢" if isinstance(net_buy, (int, float)) and net_buy < 0 else "⚪")
         msg += f"• {name}: {icon} {net_buy}\n"
         
-    msg += "\n(註: 期貨未平倉與融資券因交易所資安限制，暫以現貨為主作為每日動能觀測)"
+    # 因已加入信用交易籌碼，一併為您調整了此處的備註文字，使其更貼合現狀
+    msg += "\n(註: 大盤融資維持率無官方直接提供之API；期貨未平倉因資安限制暫以現貨為主。)"
 
     # 送出 LINE 訊息
     send_line_message(LINE_ACCESS_TOKEN, LINE_USER_ID, msg)
