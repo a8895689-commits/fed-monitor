@@ -200,7 +200,6 @@ class TaiwanDerivativesTrackerTaifex:
             res.encoding = 'big5'
             csv_text = res.text
             
-            # 若無內容直接返回
             if not csv_text.strip(): return pd.DataFrame()
             
             df = pd.read_csv(io.StringIO(csv_text), on_bad_lines='skip')
@@ -212,7 +211,8 @@ class TaiwanDerivativesTrackerTaifex:
             
             if '日期' not in df.columns: return pd.DataFrame()
             
-            df['日期'] = pd.to_datetime(df['日期'], errors='coerce')
+            # 【修復重點】：加入 .astype(str) 防止 YYYYMMDD 被誤判為 1970 奈秒時間戳
+            df['日期'] = pd.to_datetime(df['日期'].astype(str), errors='coerce')
             df = df.dropna(subset=['日期'])
             df['日期'] = df['日期'].dt.strftime('%Y/%m/%d')
             
@@ -229,7 +229,6 @@ class TaiwanDerivativesTrackerTaifex:
         d_start = start_date.strftime("%Y/%m/%d")
         d_end = end_date.strftime("%Y/%m/%d")
 
-        # 【關鍵修復 1】: 針對不同 API 準備專屬的參數，避免期交所伺服器拒絕日期區間
         def pl_pcr(): 
             return {"queryStartDate": d_start, "queryEndDate": d_end}
             
@@ -245,7 +244,6 @@ class TaiwanDerivativesTrackerTaifex:
             return "\n⚠️ 無法取得期交所籌碼數據(PCR)，請檢查網路或稍後再試\n"
         
         dates = sorted(df_pcr['日期'].unique(), reverse=True)
-        # 【關鍵修復 2】: 柔性容錯。如果真的只抓到 1 天，就不報錯，直接當作昨天的數據與今天相同
         if len(dates) == 0: 
             return "\n⚠️ 期交所目前無有效日期資料，請稍後再試\n"
         d1 = dates[0]
@@ -274,7 +272,8 @@ class TaiwanDerivativesTrackerTaifex:
                         break
                         
                 if '日期' in d.columns and '收盤指數' in d.columns:
-                    d['日期'] = pd.to_datetime(d['日期'], errors='coerce')
+                    # 【修復重點】：同步加入 .astype(str) 防呆
+                    d['日期'] = pd.to_datetime(d['日期'].astype(str), errors='coerce')
                     d = d.dropna(subset=['日期'])
                     d['日期'] = d['日期'].dt.strftime('%Y/%m/%d')
                     df_vix = d
@@ -282,9 +281,20 @@ class TaiwanDerivativesTrackerTaifex:
         except:
             pass
 
-        # ===== 安全型別轉換 =====
-        def s_int(val): return int(str(val).replace(',', '')) if pd.notna(val) else 0
-        def s_flt(val): return float(str(val).replace(',', '')) if pd.notna(val) else 0.0
+        # ===== 安全型別轉換 (加入防禦期交所的 '-' 橫槓符號) =====
+        def s_int(val): 
+            try:
+                v = str(val).replace(',', '').strip()
+                return int(v) if v and v not in ('-', '') else 0
+            except:
+                return 0
+
+        def s_flt(val): 
+            try:
+                v = str(val).replace(',', '').strip()
+                return float(v) if v and v not in ('-', '') else 0.0
+            except:
+                return 0.0
 
         # ===== 資料提取與計算邏輯 =====
         def get_pcr(d_str):
@@ -427,7 +437,6 @@ class TaiwanOptionsTracker:
         contract_col = self.find_column(df, ['契約'])
         session_col = self.find_column(df, ['時段'])
         if contract_col: df = df[df[contract_col] == 'TXO']
-        # 【修復重點】：加入 .astype(str) 防呆轉換
         if session_col: df = df[df[session_col].astype(str).str.contains('一般', na=False)]
         return df
 
@@ -482,7 +491,6 @@ class TaiwanOptionsTracker:
             oi_change = int(total_oi - prev_oi)
             oi_change_str = f"+{oi_change}" if oi_change > 0 else str(oi_change)
                 
-            # 【修復重點】：加入 .astype(str) 防呆轉換
             calls = df_sub[df_sub[cp_col].astype(str).str.contains('Call|買', case=False)].set_index(strike_col)[oi_col].to_dict()
             puts = df_sub[df_sub[cp_col].astype(str).str.contains('Put|賣', case=False)].set_index(strike_col)[oi_col].to_dict()
             
@@ -531,7 +539,6 @@ class TaiwanOptionsTracker:
         all_results.sort(key=lambda x: x['total_oi'], reverse=True)
         top_2 = all_results[:2]
         
-        # 組合 LINE 專用的選擇權字串
         msg = f"\n🎯 【台指選擇權莊家佈局】\n"
         msg += f"📅 結算日資料: {curr_date}\n"
         msg += f"📊 大盤收盤價: {taiex_close}\n"
