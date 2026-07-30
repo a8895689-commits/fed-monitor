@@ -188,7 +188,6 @@ class DailyMarketTracker:
             pass
         return chips
 
-
 import io
 import requests
 import pandas as pd
@@ -198,9 +197,9 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class TaiwanDerivativesTrackerTaifex:
-    """主題三：台指期權進階籌碼 (Cookie突破與精準除錯版)"""
+    """主題三：台指期權進階籌碼 (防護突破 & 區間查詢終極版)"""
     def __init__(self):
-        # 1. 建立 Session 來維持 Cookie
+        # 1. 維持 Session 與完美偽裝
         self.session = requests.Session()
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -208,9 +207,8 @@ class TaiwanDerivativesTrackerTaifex:
             "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
             "Origin": "https://www.taifex.com.tw"
         }
-        
-        # 2. 初始化時，先假裝去首頁逛一下，取得期交所發的 Session Cookie
         try:
+            # 假裝逛首頁，拿取通行證 (Cookie)
             self.session.get("https://www.taifex.com.tw/cht/index", headers=self.headers, timeout=5, verify=False)
         except:
             pass
@@ -227,8 +225,6 @@ class TaiwanDerivativesTrackerTaifex:
         if pd.isna(val): return None
         s = str(val).strip().replace('-', '').replace('/', '').replace('.', '').split(' ')[0]
         if not s.isdigit() or len(s) < 7: return None
-        
-        # 民國轉西元
         if len(s) == 7:
             try:
                 y = int(s[:3]) + 1911
@@ -236,7 +232,6 @@ class TaiwanDerivativesTrackerTaifex:
                 if 2020 <= y <= 2030 and 1 <= m <= 12 and 1 <= d <= 31:
                     return f"{y:04d}/{m:02d}/{d:02d}"
             except: pass
-        # 西元
         elif len(s) == 8:
             try:
                 y, m, d = int(s[:4]), int(s[4:6]), int(s[6:8])
@@ -250,7 +245,7 @@ class TaiwanDerivativesTrackerTaifex:
         if referer_url:
             headers["Referer"] = referer_url
         try:
-            # 3. 使用 self.session 發送請求，自動帶上 Cookie
+            # 帶著 Cookie 送出 POST
             res = self.session.post(url, data=payload, headers=headers, timeout=10, verify=False)
             res.encoding = 'big5'
             return res.text
@@ -258,21 +253,20 @@ class TaiwanDerivativesTrackerTaifex:
             return f"Exception Error: {e}"
 
     def fetch_data(self):
-        today = datetime.datetime.now()
-        start_date = today - datetime.timedelta(days=15)
+        end_date = datetime.datetime.now()
+        start_date = end_date - datetime.timedelta(days=10) # 抓近 10 天確保有資料
         d_start = start_date.strftime("%Y/%m/%d")
-        d_end = today.strftime("%Y/%m/%d")
+        d_end = end_date.strftime("%Y/%m/%d")
 
-        # 抓取 PCR 資料
+        # 1. 抓取 PCR 資料
         pcr_text = self._fetch_raw_text(
             "https://www.taifex.com.tw/cht/3/pcRatioDown", 
             {"queryStartDate": d_start, "queryEndDate": d_end},
-            referer_url="https://www.taifex.com.tw/cht/3/pcRatio"
+            "https://www.taifex.com.tw/cht/3/pcRatio"
         )
-        
         pcr_map = {}
         try:
-            if pcr_text and "html" not in pcr_text.lower() and "查無資料" not in pcr_text:
+            if pcr_text and "html" not in pcr_text.lower():
                 lines = [l for l in pcr_text.splitlines() if not l.startswith('※') and len(l.split(',')) > 1]
                 df = pd.read_csv(io.StringIO("\n".join(lines)), on_bad_lines='skip')
                 df.columns = df.columns.str.strip().str.replace(' ', '')
@@ -282,100 +276,91 @@ class TaiwanDerivativesTrackerTaifex:
                     for _, r in df.iterrows():
                         dt = self.parse_taifex_date(r[date_c])
                         if dt: pcr_map[dt] = self.clean_num(r[ratio_c])
-        except Exception:
-            pass
+        except: pass
 
-        # 抓取外資選擇權與小台籌碼 (單日 queryDate 迴圈)
-        call_map, put_map = {}, {}
-        mtx_inst, mtx_tot = {}, {}
-        
-        valid_days_found = 0
-        for i in range(15):  
-            test_date = today - datetime.timedelta(days=i)
-            date_str = test_date.strftime("%Y/%m/%d")
-            
-            # 三大法人選擇權分計
-            opt_text = self._fetch_raw_text(
-                "https://www.taifex.com.tw/cht/3/callsAndPutsDateDown", 
-                {"queryDate": date_str, "commodityId": "TXO"},
-                referer_url="https://www.taifex.com.tw/cht/3/callsAndPutsDate"
-            )
-            
-            if not opt_text or "html" in opt_text.lower() or "查無資料" in opt_text:
-                continue
-                
-            try:
+        # 2. 抓取外資選擇權 (TXO) -> 改回正確的區間參數
+        opt_text = self._fetch_raw_text(
+            "https://www.taifex.com.tw/cht/3/callsAndPutsDateDown", 
+            {"queryStartDate": d_start, "queryEndDate": d_end, "commodityId": "TXO"},
+            "https://www.taifex.com.tw/cht/3/callsAndPutsDate"
+        )
+        call_map, put_map = {} , {}
+        try:
+            if opt_text and "html" not in opt_text.lower():
                 lines = [l for l in opt_text.splitlines() if not l.startswith('※') and not l.startswith('單位') and len(l.split(',')) > 5]
                 df = pd.read_csv(io.StringIO("\n".join(lines)), on_bad_lines='skip')
                 df.columns = df.columns.str.strip().str.replace(' ', '')
-                id_c = next((c for c in df.columns if '身份' in c), None)
+                date_c = next((c for c in df.columns if '日期' in c), None)
                 prod_c = next((c for c in df.columns if '商品' in c), None)
                 cp_c = next((c for c in df.columns if '權別' in c or '買賣權' in c), None)
+                id_c = next((c for c in df.columns if '身份' in c), None)
                 long_c = next((c for c in df.columns if '買方' in c and '未平倉' in c and '口數' in c), None)
                 short_c = next((c for c in df.columns if '賣方' in c and '未平倉' in c and '口數' in c), None)
-                
-                if id_c and long_c and short_c:
-                    dt = self.parse_taifex_date(date_str)
-                    for _, r in df.iterrows():
-                        if '外資' in str(r[id_c]):
-                            combo = str(r[prod_c]) + (str(r[cp_c]) if cp_c else "")
-                            net = int(self.clean_num(r[long_c]) - self.clean_num(r[short_c]))
-                            if '買權' in combo: call_map[dt] = net
-                            elif '賣權' in combo: put_map[dt] = net
-            except:
-                continue
+                if date_c and id_c and long_c and short_c:
+                    for d_val in df[date_c].unique():
+                        dt = self.parse_taifex_date(d_val)
+                        if not dt: continue
+                        sub = df[df[date_c] == d_val]
+                        for _, r in sub.iterrows():
+                            if '外資' in str(r[id_c]):
+                                combo = str(r[prod_c]) + (str(r[cp_c]) if cp_c else "")
+                                net = int(self.clean_num(r[long_c]) - self.clean_num(r[short_c]))
+                                if '買權' in combo: call_map[dt] = net
+                                elif '賣權' in combo: put_map[dt] = net
+        except: pass
 
-            # 小台三大法人未平倉
-            inst_text = self._fetch_raw_text(
-                "https://www.taifex.com.tw/cht/3/futContractsDateDown", 
-                {"queryDate": date_str, "commodityId": "MXF"},
-                referer_url="https://www.taifex.com.tw/cht/3/futContractsDate"
-            )
-            try:
-                if inst_text and "html" not in inst_text.lower() and "查無資料" not in inst_text:
-                    lines = [l for l in inst_text.splitlines() if not l.startswith('※') and len(l.split(',')) > 5]
-                    df = pd.read_csv(io.StringIO("\n".join(lines)), on_bad_lines='skip')
-                    df.columns = df.columns.str.strip().str.replace(' ', '')
-                    long_c = next((c for c in df.columns if '多方' in c and '未平倉' in c and '口數' in c), None)
-                    short_c = next((c for c in df.columns if '空方' in c and '未平倉' in c and '口數' in c), None)
-                    if long_c and short_c:
-                        dt = self.parse_taifex_date(date_str)
-                        mtx_inst[dt] = int(sum(self.clean_num(r[long_c]) - self.clean_num(r[short_c]) for _, r in df.iterrows()))
-            except: pass
+        # 3. 抓取小台三大法人與全市場 (MXF) -> 改回正確的區間參數
+        inst_text = self._fetch_raw_text(
+            "https://www.taifex.com.tw/cht/3/futContractsDateDown", 
+            {"queryStartDate": d_start, "queryEndDate": d_end, "commodityId": "MXF"},
+            "https://www.taifex.com.tw/cht/3/futContractsDate"
+        )
+        daily_text = self._fetch_raw_text(
+            "https://www.taifex.com.tw/cht/3/futDataDown", 
+            {"queryStartDate": d_start, "queryEndDate": d_end, "commodity_id": "MXF", "down_type": "1"},
+            "https://www.taifex.com.tw/cht/3/futData"
+        )
+        
+        mtx_inst, mtx_tot = {}, {}
+        try:
+            if inst_text and "html" not in inst_text.lower():
+                lines = [l for l in inst_text.splitlines() if not l.startswith('※') and len(l.split(',')) > 5]
+                df = pd.read_csv(io.StringIO("\n".join(lines)), on_bad_lines='skip')
+                df.columns = df.columns.str.strip().str.replace(' ', '')
+                date_c = next((c for c in df.columns if '日期' in c), None)
+                long_c = next((c for c in df.columns if '多方' in c and '未平倉' in c and '口數' in c), None)
+                short_c = next((c for c in df.columns if '空方' in c and '未平倉' in c and '口數' in c), None)
+                if date_c and long_c and short_c:
+                    for d_val in df[date_c].unique():
+                        dt = self.parse_taifex_date(d_val)
+                        if not dt: continue
+                        sub = df[df[date_c] == d_val]
+                        mtx_inst[dt] = int(sum(self.clean_num(r[long_c]) - self.clean_num(r[short_c]) for _, r in sub.iterrows()))
+        except: pass
 
-            # 小台全市場行情未平倉
-            daily_text = self._fetch_raw_text(
-                "https://www.taifex.com.tw/cht/3/futDataDown", 
-                {"queryDate": date_str, "commodity_id": "MXF", "down_type": "1"},
-                referer_url="https://www.taifex.com.tw/cht/3/futData"
-            )
-            try:
-                if daily_text and "html" not in daily_text.lower() and "查無資料" not in daily_text:
-                    lines = [l for l in daily_text.splitlines() if not l.startswith('※') and len(l.split(',')) > 5]
-                    df = pd.read_csv(io.StringIO("\n".join(lines)), on_bad_lines='skip')
-                    df.columns = df.columns.str.strip().str.replace(' ', '')
-                    session_c = next((c for c in df.columns if '時段' in c), None)
-                    oi_c = next((c for c in df.columns if '未沖銷' in c), None)
-                    if oi_c:
+        try:
+            if daily_text and "html" not in daily_text.lower():
+                lines = [l for l in daily_text.splitlines() if not l.startswith('※') and len(l.split(',')) > 5]
+                df = pd.read_csv(io.StringIO("\n".join(lines)), on_bad_lines='skip')
+                df.columns = df.columns.str.strip().str.replace(' ', '')
+                date_c = next((c for c in df.columns if '日期' in c), None)
+                session_c = next((c for c in df.columns if '時段' in c), None)
+                oi_c = next((c for c in df.columns if '未沖銷' in c), None)
+                if date_c and oi_c:
+                    for d_val in df[date_c].unique():
+                        dt = self.parse_taifex_date(d_val)
+                        if not dt: continue
+                        sub = df[df[date_c] == d_val]
                         if session_c:
-                            df = df[df[session_c].astype(str).str.contains('一般', na=False)]
-                        dt = self.parse_taifex_date(date_str)
-                        mtx_tot[dt] = int(sum(self.clean_num(r[oi_c]) for _, r in df.iterrows()))
-            except: pass
+                            sub = sub[sub[session_c].astype(str).str.contains('一般', na=False)]
+                        mtx_tot[dt] = int(sum(self.clean_num(r[oi_c]) for _, r in sub.iterrows()))
+        except: pass
 
-            dt_check = self.parse_taifex_date(date_str)
-            if dt_check in mtx_tot and dt_check in call_map:
-                valid_days_found += 1
-            
-            if valid_days_found >= 2:
-                break
+        # 把所有成功抓到資料的日期整合在一起
+        all_dates = sorted(list(set(list(pcr_map.keys()) + list(call_map.keys()) + list(mtx_tot.keys()))), reverse=True)
 
-        all_dates = sorted(list(set(list(call_map.keys()) + list(mtx_tot.keys()))), reverse=True)
-
-        # 4. 關鍵修正：若抓不到資料，直接印出伺服器回傳的前 150 個字元，取代原本無意義的長度
         if len(all_dates) < 1:
-            error_snippet = pcr_text[:150].replace('\n', ' ') if pcr_text else "完全無回傳值"
-            return f"\n⚠️ 期交所拒絕連線。\n👉 伺服器實際回傳內容片段：\n[{error_snippet}...]\n"
+            return f"\n⚠️ 期交所拒絕連線。\n👉 伺服器實際回傳內容片段：\n[{pcr_text[:150] if pcr_text else '無回傳'}...]\n"
 
         d1 = all_dates[0]
         d2 = all_dates[1] if len(all_dates) > 1 else d1
@@ -398,8 +383,8 @@ class TaiwanDerivativesTrackerTaifex:
         msg += f"• 外資買權淨未平倉: {s_str(fc_1)} (增減 {s_str(fc_1 - fc_2)})\n"
         msg += f"• 外資賣權淨未平倉: {s_str(fp_1)} (增減 {s_str(fp_1 - fp_2)})\n"
         msg += f"• 散戶小台淨未平倉: {s_str(ret_m_1)} (增減 {s_str(ret_m_1 - ret_m_2)})\n"
-        msg += f"• 小台散戶多空比: {s_fstr(rr_m_2)}% {ar(rr_m_1, rr_m_2)} {s_fstr(rr_m_1)}%\n"
-        msg += f"• 全市場Put/Call Ratio: {pcr_2:.2f}% {ar(pcr_1, pcr_2)} {pcr_1:.2f}%\n"
+        msg += f"• 小台散戶多空比: {s_fstr(rr_m_1)}% {ar(rr_m_1, rr_m_2)} {s_fstr(rr_m_2)}%\n"
+        msg += f"• 全市場Put/Call Ratio: {pcr_1:.2f}% {ar(pcr_1, pcr_2)} {pcr_2:.2f}%\n"
         return msg
 
 class TaiwanOptionsTracker:
