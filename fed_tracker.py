@@ -190,7 +190,7 @@ class DailyMarketTracker:
 
 
 class TaiwanDerivativesTrackerTaifex:
-    """主題三：台指期權進階籌碼 (隱藏參數破解版)"""
+    """主題三：台指期權進階籌碼"""
     def __init__(self):
         self.session = requests.Session()
         self.headers = {
@@ -262,7 +262,7 @@ class TaiwanDerivativesTrackerTaifex:
 
         pcr_map, call_map, put_map, mtx_inst, mtx_tot = {}, {}, {}, {}, {}
 
-        # 1. 抓取 PCR (已補上 firstDate 和 lastDate)
+        # 1. 抓取 PCR
         pcr_payload = {
             "queryStartDate": d_start, 
             "queryEndDate": d_end,
@@ -285,18 +285,15 @@ class TaiwanDerivativesTrackerTaifex:
         for i in range(15):
             test_date = end_date - datetime.timedelta(days=i)
             date_str = test_date.strftime("%Y/%m/%d")
-            
-            # 從你的截圖中破解出來的共同隱藏參數
-            hidden_params = {
-                "firstDate": "2020/01/01 00:00",
-                "lastDate": "2030/12/31 00:00",
-                "queryStartDate": date_str, 
-                "queryEndDate": date_str
-            }
 
             # (A) 外資選擇權 (TXO)
-            opt_payload = hidden_params.copy()
-            opt_payload["commodityId"] = "TXO"
+            opt_payload = {
+                "queryStartDate": date_str,
+                "queryEndDate": date_str,
+                "commodityId": "TXO",
+                "firstDate": "2020/01/01 00:00",
+                "lastDate": "2030/12/31 00:00"
+            }
             opt_text = self._fetch_raw_text("https://www.taifex.com.tw/cht/3/callsAndPutsDateDown", opt_payload)
             opt_df = self.parse_csv_safe(opt_text)
             if opt_df is not None:
@@ -316,8 +313,13 @@ class TaiwanDerivativesTrackerTaifex:
                             elif '賣權' in combo: put_map[dt] = net
 
             # (B) 小台三大法人 (MXF)
-            inst_payload = hidden_params.copy()
-            inst_payload["commodityId"] = "MXF"
+            inst_payload = {
+                "queryStartDate": date_str,
+                "queryEndDate": date_str,
+                "commodityId": "MXF",
+                "firstDate": "2020/01/01 00:00",
+                "lastDate": "2030/12/31 00:00"
+            }
             inst_text = self._fetch_raw_text("https://www.taifex.com.tw/cht/3/futContractsDateDown", inst_payload)
             inst_df = self.parse_csv_safe(inst_text)
             if inst_df is not None:
@@ -327,18 +329,16 @@ class TaiwanDerivativesTrackerTaifex:
                     dt = self.parse_taifex_date(date_str)
                     mtx_inst[dt] = int(sum(self.clean_num(r[long_c]) - self.clean_num(r[short_c]) for _, r in inst_df.iterrows()))
 
-            # (C) 小台全市場未平倉 (MXF)
+            # (C) 小台全市場未平倉 (下載端點為 cht/3/futDataDown，對應代碼為 MTX)
             tot_payload = {
                 "down_type": "1",
-                "commodity_id": "MXF",
-                "commodityId": "MXF", 
+                "commodity_id": "MTX", 
                 "queryStartDate": date_str,
                 "queryEndDate": date_str,
-                "queryDate": date_str, 
                 "firstDate": "2020/01/01 00:00",
                 "lastDate": "2030/12/31 00:00"
             }
-            tot_text = self._fetch_raw_text("https://www.taifex.com.tw/cht/2/futDailyMarketDown", tot_payload)
+            tot_text = self._fetch_raw_text("https://www.taifex.com.tw/cht/3/futDataDown", tot_payload)
             tot_df = self.parse_csv_safe(tot_text)
             
             if tot_df is not None:
@@ -422,16 +422,14 @@ class TaiwanOptionsTracker:
     def get_taifex_csv(self, date_obj):
         date_str = date_obj.strftime("%Y/%m/%d")
         url = "https://www.taifex.com.tw/cht/3/optDataDown"
-        # 這裡原本漏掉了 firstDate 和 lastDate，我已經補上！
+        # 依照要求將此處完全復原為原樣
         payload = {
             "down_type": "1", 
             "commodity_id": "TXO", 
             "commodity_id2": "",
             "queryStartDate": date_str, 
             "queryEndDate": date_str, 
-            "macrostype": "siron",
-            "firstDate": "2020/01/01 00:00",
-            "lastDate": "2030/12/31 00:00"
+            "macrostype": "siron"
         }
         try:
             response = requests.post(url, data=payload, headers=self.headers, timeout=10, verify=False)
