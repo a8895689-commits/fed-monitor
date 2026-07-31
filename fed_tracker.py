@@ -1,14 +1,14 @@
 import os
 import urllib.request
+import urllib.parse
+import urllib3
 import json
 import pandas as pd
 import yfinance as yf
 import requests
 import time
-import urllib.parse
 import datetime
 import io
-import urllib3
 
 pd.options.mode.chained_assignment = None
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -188,13 +188,6 @@ class DailyMarketTracker:
             pass
         return chips
 
-import io
-import requests
-import pandas as pd
-import datetime
-import urllib3
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class TaiwanDerivativesTrackerTaifex:
     """主題三：台指期權進階籌碼 (隱藏參數破解版)"""
@@ -238,13 +231,11 @@ class TaiwanDerivativesTrackerTaifex:
         try:
             res = self.session.post(url, data=payload, headers=self.headers, timeout=10, verify=False)
             res.encoding = 'big5'
-            # 移除可能干擾解析的 BOM 標記
             return res.text.replace('\ufeff', '')
         except Exception as e:
             return ""
 
     def parse_csv_safe(self, text):
-        # 如果伺服器回傳的是網頁 (HTML) 而不是 CSV 格式，直接判定失敗
         if not text or "<html" in text.lower() or "查無資料" in text or "<!doctype" in text.lower():
             return None
         lines = []
@@ -271,11 +262,14 @@ class TaiwanDerivativesTrackerTaifex:
 
         pcr_map, call_map, put_map, mtx_inst, mtx_tot = {}, {}, {}, {}, {}
 
-        # 1. 抓取 PCR
-        pcr_text = self._fetch_raw_text(
-            "https://www.taifex.com.tw/cht/3/pcRatioDown", 
-            {"queryStartDate": d_start, "queryEndDate": d_end}
-        )
+        # 1. 抓取 PCR (已補上 firstDate 和 lastDate)
+        pcr_payload = {
+            "queryStartDate": d_start, 
+            "queryEndDate": d_end,
+            "firstDate": "2020/01/01 00:00",
+            "lastDate": "2030/12/31 00:00"
+        }
+        pcr_text = self._fetch_raw_text("https://www.taifex.com.tw/cht/3/pcRatioDown", pcr_payload)
         pcr_df = self.parse_csv_safe(pcr_text)
         if pcr_df is not None:
             date_c = next((c for c in pcr_df.columns if '日期' in c), None)
@@ -333,14 +327,14 @@ class TaiwanDerivativesTrackerTaifex:
                     dt = self.parse_taifex_date(date_str)
                     mtx_inst[dt] = int(sum(self.clean_num(r[long_c]) - self.clean_num(r[short_c]) for _, r in inst_df.iterrows()))
 
-            # (C) 小台全市場未平倉 (MXF) - 針對每日行情的終極防呆 Payload
+            # (C) 小台全市場未平倉 (MXF)
             tot_payload = {
                 "down_type": "1",
                 "commodity_id": "MXF",
-                "commodityId": "MXF", # 故意兩個大小寫都給
+                "commodityId": "MXF", 
                 "queryStartDate": date_str,
                 "queryEndDate": date_str,
-                "queryDate": date_str, # 故意把單一日期也補上
+                "queryDate": date_str, 
                 "firstDate": "2020/01/01 00:00",
                 "lastDate": "2030/12/31 00:00"
             }
@@ -356,7 +350,6 @@ class TaiwanDerivativesTrackerTaifex:
                     dt = self.parse_taifex_date(date_str)
                     mtx_tot[dt] = int(sum(self.clean_num(r[oi_c]) for _, r in tot_df.iterrows()))
             else:
-                # 升級除錯：如果失敗，印出伺服器回傳的真實內容前40字
                 snippet = (tot_text[:40].replace('\n', '').replace('\r', '') + "...") if tot_text else "無回應或完全空白"
                 debug_log += f"[{date_str} 伺服器回傳: {snippet}] "
 
@@ -429,9 +422,16 @@ class TaiwanOptionsTracker:
     def get_taifex_csv(self, date_obj):
         date_str = date_obj.strftime("%Y/%m/%d")
         url = "https://www.taifex.com.tw/cht/3/optDataDown"
+        # 這裡原本漏掉了 firstDate 和 lastDate，我已經補上！
         payload = {
-            "down_type": "1", "commodity_id": "TXO", "commodity_id2": "",
-            "queryStartDate": date_str, "queryEndDate": date_str, "macrostype": "siron"
+            "down_type": "1", 
+            "commodity_id": "TXO", 
+            "commodity_id2": "",
+            "queryStartDate": date_str, 
+            "queryEndDate": date_str, 
+            "macrostype": "siron",
+            "firstDate": "2020/01/01 00:00",
+            "lastDate": "2030/12/31 00:00"
         }
         try:
             response = requests.post(url, data=payload, headers=self.headers, timeout=10, verify=False)
@@ -481,7 +481,7 @@ class TaiwanOptionsTracker:
                 break
                 
         if len(valid_dfs) < 1:
-            return "⚠️ 無法取得期交所選擇權資料"
+            return "⚠️ 無法取得期交所選擇權資料 (可能為假日或參數無效)"
 
         dates_found = list(valid_dfs.keys())
         curr_date = dates_found[0]
