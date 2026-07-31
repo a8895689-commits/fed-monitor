@@ -303,6 +303,8 @@ class TaiwanDerivativesTrackerTaifex:
                     "commodityId": "TXO"
                 }
             )
+            print(f"【DEBUG {date_str} 伺服器回傳前300字】:", repr(opt_text[:300])) 
+
             opt_df = self.parse_csv_safe(opt_text)
             if opt_df is not None:
                 id_c = next((c for c in opt_df.columns if '身份' in c), None)
