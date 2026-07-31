@@ -197,7 +197,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class TaiwanDerivativesTrackerTaifex:
-    """主題三：台指期權進階籌碼 (參數與端點終極修正版)"""
+    """主題三：台指期權進階籌碼 (隱藏參數破解版)"""
     def __init__(self):
         self.session = requests.Session()
         self.headers = {
@@ -234,18 +234,18 @@ class TaiwanDerivativesTrackerTaifex:
             except: pass
         return None
 
-    def _fetch_raw_text(self, url, payload, referer_url=None):
-        headers = self.headers.copy()
-        if referer_url: headers["Referer"] = referer_url
+    def _fetch_raw_text(self, url, payload):
         try:
-            res = self.session.post(url, data=payload, headers=headers, timeout=10, verify=False)
+            res = self.session.post(url, data=payload, headers=self.headers, timeout=10, verify=False)
             res.encoding = 'big5'
-            return res.text
+            # 移除可能干擾解析的 BOM 標記
+            return res.text.replace('\ufeff', '')
         except Exception as e:
             return ""
 
     def parse_csv_safe(self, text):
-        if not text or "html" in text.lower() or "查無資料" in text:
+        # 如果伺服器回傳的是網頁 (HTML) 而不是 CSV 格式，直接判定失敗
+        if not text or "<html" in text.lower() or "查無資料" in text or "<!doctype" in text.lower():
             return None
         lines = []
         for l in text.splitlines():
@@ -271,11 +271,10 @@ class TaiwanDerivativesTrackerTaifex:
 
         pcr_map, call_map, put_map, mtx_inst, mtx_tot = {}, {}, {}, {}, {}
 
-        # 1. 抓取 PCR 資料 (區間)
+        # 1. 抓取 PCR
         pcr_text = self._fetch_raw_text(
             "https://www.taifex.com.tw/cht/3/pcRatioDown", 
-            {"queryStartDate": d_start, "queryEndDate": d_end},
-            "https://www.taifex.com.tw/cht/3/pcRatio"
+            {"queryStartDate": d_start, "queryEndDate": d_end}
         )
         pcr_df = self.parse_csv_safe(pcr_text)
         if pcr_df is not None:
@@ -287,30 +286,29 @@ class TaiwanDerivativesTrackerTaifex:
                     dt = self.parse_taifex_date(r[date_c])
                     if dt: pcr_map[dt] = self.clean_num(r[ratio_c])
 
-        # 2. 用單日迴圈抓取選擇權與小台
         valid_days = 0
         debug_log = ""
         for i in range(15):
             test_date = end_date - datetime.timedelta(days=i)
             date_str = test_date.strftime("%Y/%m/%d")
             
-            # (A) 外資選擇權 (TXO) - 修正：改用 StartDate 與 EndDate
-            opt_text = self._fetch_raw_text(
-                "https://www.taifex.com.tw/cht/3/callsAndPutsDateDown", 
-                {
-                    "queryStartDate": date_str, 
-                    "queryEndDate": date_str, 
-                    "commodityId": "TXO"
-                }
-            )
-            print(f"【DEBUG {date_str} 伺服器回傳前300字】:", repr(opt_text[:300])) 
+            # 從你的截圖中破解出來的共同隱藏參數
+            hidden_params = {
+                "firstDate": "2020/01/01 00:00",
+                "lastDate": "2030/12/31 00:00",
+                "queryStartDate": date_str, 
+                "queryEndDate": date_str
+            }
 
+            # (A) 外資選擇權 (TXO)
+            opt_payload = hidden_params.copy()
+            opt_payload["commodityId"] = "TXO"
+            opt_text = self._fetch_raw_text("https://www.taifex.com.tw/cht/3/callsAndPutsDateDown", opt_payload)
             opt_df = self.parse_csv_safe(opt_text)
             if opt_df is not None:
                 id_c = next((c for c in opt_df.columns if '身份' in c), None)
                 prod_c = next((c for c in opt_df.columns if '商品' in c), None)
                 cp_c = next((c for c in opt_df.columns if '權別' in c or '買賣權' in c), None)
-                # 排除金額欄位，精準定位「量」
                 long_c = next((c for c in opt_df.columns if '買方' in c and '未平倉' in c and '金額' not in c), None)
                 short_c = next((c for c in opt_df.columns if '賣方' in c and '未平倉' in c and '金額' not in c), None)
                 
@@ -323,15 +321,10 @@ class TaiwanDerivativesTrackerTaifex:
                             if '買權' in combo: call_map[dt] = net
                             elif '賣權' in combo: put_map[dt] = net
 
-            # (B) 小台三大法人 (MXF) - 修正：改用 StartDate 與 EndDate
-            inst_text = self._fetch_raw_text(
-                "https://www.taifex.com.tw/cht/3/futContractsDateDown", 
-                {
-                    "queryStartDate": date_str, 
-                    "queryEndDate": date_str, 
-                    "commodityId": "MXF"
-                }
-            )
+            # (B) 小台三大法人 (MXF)
+            inst_payload = hidden_params.copy()
+            inst_payload["commodityId"] = "MXF"
+            inst_text = self._fetch_raw_text("https://www.taifex.com.tw/cht/3/futContractsDateDown", inst_payload)
             inst_df = self.parse_csv_safe(inst_text)
             if inst_df is not None:
                 long_c = next((c for c in inst_df.columns if '多方' in c and '未平倉' in c and '金額' not in c), None)
@@ -340,17 +333,20 @@ class TaiwanDerivativesTrackerTaifex:
                     dt = self.parse_taifex_date(date_str)
                     mtx_inst[dt] = int(sum(self.clean_num(r[long_c]) - self.clean_num(r[short_c]) for _, r in inst_df.iterrows()))
 
-            # (C) 小台全市場未平倉 (MXF) - 修正：URL 更換為 futDailyMarketDown，參數改用 StartDate/EndDate
-            tot_text = self._fetch_raw_text(
-                "https://www.taifex.com.tw/cht/2/futDailyMarketDown", 
-                {
-                    "queryStartDate": date_str, 
-                    "queryEndDate": date_str, 
-                    "commodity_id": "MXF", 
-                    "down_type": "1"
-                }
-            )
+            # (C) 小台全市場未平倉 (MXF) - 針對每日行情的終極防呆 Payload
+            tot_payload = {
+                "down_type": "1",
+                "commodity_id": "MXF",
+                "commodityId": "MXF", # 故意兩個大小寫都給
+                "queryStartDate": date_str,
+                "queryEndDate": date_str,
+                "queryDate": date_str, # 故意把單一日期也補上
+                "firstDate": "2020/01/01 00:00",
+                "lastDate": "2030/12/31 00:00"
+            }
+            tot_text = self._fetch_raw_text("https://www.taifex.com.tw/cht/2/futDailyMarketDown", tot_payload)
             tot_df = self.parse_csv_safe(tot_text)
+            
             if tot_df is not None:
                 session_c = next((c for c in tot_df.columns if '時段' in c), None)
                 oi_c = next((c for c in tot_df.columns if '未沖銷' in c or '未平倉' in c), None)
@@ -360,19 +356,20 @@ class TaiwanDerivativesTrackerTaifex:
                     dt = self.parse_taifex_date(date_str)
                     mtx_tot[dt] = int(sum(self.clean_num(r[oi_c]) for _, r in tot_df.iterrows()))
             else:
-                debug_log += f"[{date_str}無行情] "
+                # 升級除錯：如果失敗，印出伺服器回傳的真實內容前40字
+                snippet = (tot_text[:40].replace('\n', '').replace('\r', '') + "...") if tot_text else "無回應或完全空白"
+                debug_log += f"[{date_str} 伺服器回傳: {snippet}] "
 
-            # 確認當天這三項指標都有抓到，才算一個完整的交易日
+            # 檢查交集：確保這三天都有資料
             dt_check = self.parse_taifex_date(date_str)
             if dt_check in call_map and dt_check in mtx_tot:
                 valid_days += 1
                 if valid_days >= 2: break
 
-        # 交集檢查：只留下「有 PCR」且「有選擇權」且「有小台未平倉」的日期
         valid_dates = sorted([d for d in pcr_map if d in call_map and d in mtx_tot], reverse=True)
 
         if len(valid_dates) < 1:
-            return f"\n⚠️ 解析失敗。找到了PCR資料，但無法合併其他籌碼。\n除錯紀錄：{debug_log}\n"
+            return f"\n⚠️ 解析失敗。找到了PCR資料，但無法合併其他籌碼。\n🔍 深度除錯 (伺服器實際回傳內容)：\n{debug_log}\n"
 
         d1 = valid_dates[0]
         d2 = valid_dates[1] if len(valid_dates) > 1 else d1
