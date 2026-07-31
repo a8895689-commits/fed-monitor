@@ -195,6 +195,7 @@ class TaiwanDerivativesTrackerTaifex:
         self.session = requests.Session()
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer": "https://www.taifex.com.tw/cht/3/futDailyMarketReport", # 加上這行告訴伺服器我們是從官網來的
             "Origin": "https://www.taifex.com.tw"
         }
         try:
@@ -333,10 +334,10 @@ class TaiwanDerivativesTrackerTaifex:
             tot_payload = {
                 "down_type": "1",
                 "commodity_id": "MTX", 
+                "commodity_id2": "",           # 補上空值參數
                 "queryStartDate": date_str,
                 "queryEndDate": date_str,
-                "firstDate": "2020/01/01 00:00",
-                "lastDate": "2030/12/31 00:00"
+                "macrostype": "siron"
             }
             tot_text = self._fetch_raw_text("https://www.taifex.com.tw/cht/3/futDataDown", tot_payload)
             tot_df = self.parse_csv_safe(tot_text)
